@@ -209,12 +209,37 @@ local function nav()
 	return ui.row({ gap = 6, align = "center" }, items)
 end
 
+-- Complete a task, or reopen it when it is already closed. Both are
+-- idempotent server-side; an unknown outcome is resolved by refreshing rather
+-- than by guessing.
+local function toggleTask(t)
+	if client.busy() then
+		return
+	end
+	local id = tostring(t.id)
+	local op = (t.checked == true) and "task.reopen" or "task.complete"
+	highlightId = id
+	if client.send(op, { id = id }) then
+		render()
+	end
+end
+
 local function taskRow(t)
 	local rowItems = {}
 
 	local p = tonumber(t.p) or 4
 	rowItems[#rowItems + 1] = ui.glyph({ name = "flag", size = 14, color = PCOLOR[p] or MUTED })
-	rowItems[#rowItems + 1] = ui.glyph({ name = "circle", size = 15, color = MUTED })
+	local closed = t.checked == true
+	rowItems[#rowItems + 1] = ui.button({
+		glyph = closed and "circle-check" or "circle",
+		variant = "ghost",
+		controlSize = "sm",
+		tooltip = noctalia.tr(closed and "ui.panel.reopen" or "ui.panel.complete"),
+		enabled = not client.busy(),
+		onClick = function()
+			toggleTask(t)
+		end,
+	})
 
 	local due = dates.formatDue(t.due)
 	local metaParts = {}
@@ -374,13 +399,6 @@ local function footer()
 		maxLines = 2,
 	})
 
-	items[#items + 1] = ui.label({
-		text = noctalia.tr("ui.panel.readonly"),
-		fontSize = 11,
-		color = MUTED,
-		maxLines = 1,
-	})
-
 	local summary = defaultsSummary()
 	if summary then
 		items[#items + 1] = ui.label({
@@ -468,6 +486,19 @@ noctalia.state.watch("evt.panel", function(msg)
 		else
 			setStatus("err", errText(msg.err))
 			noctalia.notifyError(noctalia.tr("notify.failed"), errText(msg.err))
+		end
+		render()
+	elseif op == "task.complete" or op == "task.reopen" then
+		if msg.ok then
+			snap.error = nil
+			statusKind, statusText = nil, nil
+		elseif msg.unknown_outcome then
+			-- The mutation may or may not have landed: re-read rather than
+			-- retry, so we never close or reopen a task twice.
+			setStatus("warn", noctalia.tr("err.unknown_outcome_refresh"))
+			client.send("tasks.refresh", {})
+		else
+			setStatus("err", errText(msg.err))
 		end
 		render()
 	elseif op == "tasks.fetch" or op == "tasks.refresh" then

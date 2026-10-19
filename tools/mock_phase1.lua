@@ -220,7 +220,7 @@ noctalia = {
 
 -- ── fake Todoist backend ────────────────────────────────────────
 local calls = {}
-local fault = { filter_overdue = false, quick = false } -- false | "http500" | "transport"
+local fault = { filter_overdue = false, quick = false, close = false } -- false | "http500" | "transport"
 
 local PROJECTS_P1 = {
 	{ id = "p-inbox", name = "Inbox", inbox_project = true, is_shared = false },
@@ -355,8 +355,17 @@ function route(req)
 		end
 	end
 
-	if msub ~= nil and MUT.tasks[msub] ~= nil and method == "POST" then
-		if verb == "close" or verb == "reopen" then
+	if msub ~= nil and method == "POST" then
+		if verb == "close" then
+			if fault.close == "transport" then
+				return resp(0, nil)
+			end
+			if fault.close == "http500" then
+				return resp(500, { message = "boom" })
+			end
+			return resp(204, nil)
+		end
+		if verb == "reopen" then
 			return resp(204, nil)
 		end
 		if verb == "move" then
@@ -932,6 +941,139 @@ local err_body = register({ error = "Invalid date", error_code = 20, error_tag =
 check("errorMessage extracts .error", api.errorMessage(err_body) == "Invalid date", api.errorMessage(err_body))
 check("errorMessage nil for empty body", api.errorMessage("") == nil)
 check("errorMessage nil for non-json", api.errorMessage("nope") == nil)
+
+-- ── T12: M2 task.complete / task.reopen ─────────────────────────
+print("\n== T12 complete / reopen ==")
+env = { TODOIST_API_TOKEN = "valid-token" }
+cfg.max_retries = 1
+fault.close = false
+calls = {}
+loadService()
+update() -- controlled boot: overdue=1, today=2, p1=1, inbox=1
+local s12 = getState("todoist")
+check("T12 setup: today holds 2", s12.views.today.count == 2, s12.views.today.count)
+check("T12 setup: active view today", s12.view == "today", s12.view)
+
+-- complete: one POST, then a purely local reconcile (no extra GET)
+calls = {}
+fire("cmd.panel", { seq = 101, op = "task.complete", args = { id = "t1" } })
+local ev = getState("evt.panel")
+check("complete reply ok", ev ~= nil and ev.seq == 101 and ev.ok == true, ev and ev.err and ev.err.kind)
+check("complete reply carries data.checked", ev ~= nil and type(ev.data) == "table" and ev.data.checked == true and ev.data.id == "t1", ev and ev.data and ev.data.checked)
+check("complete POSTs /tasks/t1/close", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/tasks/t1/close", 1, true) ~= nil
+end) == 1)
+check("complete makes no extra request", #calls == 1, #calls)
+check("t1 gone from overdue", s12.views.overdue.count == 0 and #s12.views.overdue.tasks == 0, s12.views.overdue.count)
+check("t1 gone from today, t2 kept", s12.views.today.count == 1 and s12.views.today.tasks[1].id == "t2", s12.views.today.count)
+check("t1 gone from p1", s12.views.p1.count == 0, s12.views.p1.count)
+check("counts recomputed", s12.counts.overdue == 0 and s12.counts.today == 1 and s12.counts.p1 == 0, tostring(s12.counts.today))
+
+-- reopen: POST then re-fetch the active view (a filter cannot be recomputed)
+calls = {}
+fire("cmd.panel", { seq = 102, op = "task.reopen", args = { id = "t2" } })
+ev = getState("evt.panel")
+check("reopen reply ok", ev ~= nil and ev.seq == 102 and ev.ok == true, ev and ev.err and ev.err.kind)
+check("reopen POSTs /tasks/t2/reopen", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/tasks/t2/reopen", 1, true) ~= nil
+end) == 1)
+check("reopen re-fetches the active (today) view", filterCalls("today") == 1, filterCalls("today"))
+check("reopen does not touch the task count", s12.views.today.count == 2, s12.views.today.count)
+
+-- guards: no HTTP is attempted for a malformed or unconfigured call
+calls = {}
+fire("cmd.panel", { seq = 103, op = "task.complete", args = {} })
+ev = getState("evt.panel")
+check("complete without id is validation", ev ~= nil and ev.ok == false and ev.err.kind == "validation", ev and ev.err and ev.err.kind)
+check("complete without id sends no HTTP", #calls == 0, #calls)
+
+env = {}
+cfg.token = ""
+cfg.token_file = ""
+calls = {}
+fire("cmd.panel", { seq = 104, op = "task.complete", args = { id = "t2" } })
+ev = getState("evt.panel")
+check("complete without token is config", ev ~= nil and ev.ok == false and ev.err.kind == "config", ev and ev.err and ev.err.kind)
+check("complete without token sends no HTTP", #calls == 0, #calls)
+
+-- a dropped connection is reported as unknown_outcome, never silently retried
+env = { TODOIST_API_TOKEN = "valid-token" }
+calls = {}
+fault.close = "transport"
+fire("cmd.panel", { seq = 105, op = "task.complete", args = { id = "t2" } })
+ev = getState("evt.panel")
+check("transient close -> unknown_outcome", ev ~= nil and ev.ok == false and ev.unknown_outcome == true, ev and ev.err and ev.err.kind)
+check("transient close is attempted once (no retry in M2)", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/tasks/t2/close", 1, true) ~= nil
+end) == 1)
+fault.close = false
+
+-- ── T12b: panel checkbox is a live control ──────────────────────
+print("\n== T12b panel checkbox ==")
+-- Drop any deep-link left over from the launcher test: it would make onOpen
+-- issue a fetch, leaving the client busy so a click is ignored.
+state_store["open_task"] = nil
+local function settlePanel()
+	local pc = getState("cmd.panel")
+	if type(pc) == "table" and pc.seq ~= nil then
+		fire("evt.panel", { seq = pc.seq, op = pc.op, ok = true })
+	end
+end
+state_store["todoist"] = {
+	schema = 1,
+	token_configured = true,
+	view = "inbox",
+	tasks = { { id = "t3", content = "Inbox task", p = 4, url = "u" } },
+	views = { inbox = { tasks = { { id = "t3", content = "Inbox task", p = 4, url = "u" } }, count = 1 } },
+	projects = {},
+	counts = {},
+	defaults = {},
+	fetched_at = 0,
+}
+onOpen({})
+settlePanel()
+local function findButton(pred)
+	local found = nil
+	local function rec(n)
+		if type(n) ~= "table" then
+			return
+		end
+		if n.kind == "button" and pred(n.props) then
+			found = n
+		end
+		for _, c in ipairs(n.children or {}) do
+			rec(c)
+		end
+	end
+	rec(rendered)
+	return found
+end
+
+local toggle = findButton(function(props)
+	return props.glyph == "circle"
+end)
+check("open task shows a circle (unchecked) button", toggle ~= nil)
+state_store["cmd.panel"] = nil
+if toggle then
+	toggle.props.onClick()
+end
+local cmd = getState("cmd.panel")
+check("clicking an open task sends task.complete", cmd ~= nil and cmd.op == "task.complete" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
+
+state_store["todoist"].tasks[1].checked = true
+state_store["todoist"].views.inbox.tasks[1].checked = true
+onOpen({})
+settlePanel()
+local toggle2 = findButton(function(props)
+	return props.glyph == "circle-check"
+end)
+check("closed task shows a circle-check (checked) button", toggle2 ~= nil)
+state_store["cmd.panel"] = nil
+if toggle2 then
+	toggle2.props.onClick()
+end
+cmd = getState("cmd.panel")
+check("clicking a closed task sends task.reopen", cmd ~= nil and cmd.op == "task.reopen" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
 
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)
