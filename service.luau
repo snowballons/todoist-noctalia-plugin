@@ -218,6 +218,8 @@ local function reply(sender, seq, op, result)
 		err = result.err,
 		unknown_outcome = result.unknown_outcome == true,
 		warning = result.warning,
+		-- Additive: lets the panel highlight the task a result refers to.
+		data = result.data,
 	})
 end
 
@@ -474,6 +476,67 @@ local function fetchOne(view, projectId, force, done)
 	end)
 end
 
+-- ── local reconcile ─────────────────────────────────────────────
+-- A completed task leaves every view we hold: the filter views because it no
+-- longer matches them, and the project/inbox views because the panel lists
+-- actionable work only. Reopening is the reverse, but a filter view cannot be
+-- recomputed locally, so the caller re-fetches instead of guessing.
+
+local function removeFromViews(id)
+	local any = false
+	for _, v in pairs(snapshot.views) do
+		if type(v) == "table" and type(v.tasks) == "table" then
+			local kept, hit = {}, false
+			for _, t in ipairs(v.tasks) do
+				if t.id == id then
+					hit = true
+				else
+					kept[#kept + 1] = t
+				end
+			end
+			if hit then
+				v.tasks = kept
+				v.count = #kept
+				any = true
+			end
+		end
+	end
+	return any
+end
+
+local function patchInViews(id, patch)
+	local any = false
+	for _, v in pairs(snapshot.views) do
+		if type(v) == "table" and type(v.tasks) == "table" then
+			for _, t in ipairs(v.tasks) do
+				if t.id == id then
+					for k, val in pairs(patch) do
+						t[k] = val
+					end
+					any = true
+				end
+			end
+		end
+	end
+	return any
+end
+
+-- Re-fetch whatever the panel is showing: a filter view, inbox, or the
+-- "project:<id>" key that setActiveView stores.
+local function refetchActive(done)
+	local key = snapshot.view
+	if type(key) ~= "string" or key == "" then
+		done({ ok = true })
+		return
+	end
+	local pid = key:match("^project:(.+)$")
+	if pid then
+		fetchOne("project", pid, true, done)
+	else
+		fetchOne(key, nil, true, done)
+	end
+end
+
 -- ── ops ─────────────────────────────────────────────────────────
 local enqueueInternal
 
@@ -517,6 +580,67 @@ local function opTaskCreate(args, done)
 	end)
 end
 
+-- closeTask answers 204 and is idempotent, so a transient failure leaves the
+-- task closed or not — report the doubt rather than guess. (Bounded retry and
+-- a confirming GET land with the retry-policy split.)
+local function opTaskComplete(args, done)
+	local id = args and args.id
+	if type(id) ~= "string" or id == "" then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "id" } })
+		return
+	end
+	local token = resolveToken()
+	if token == nil then
+		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
+		return
+	end
+	api.closeTask(token, id, function(r)
+		if not r.ok then
+			if r.err and api.isTransient(r.err.kind) then
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			else
+				done({ ok = false, err = r.err })
+			end
+			return
+		end
+		removeFromViews(id)
+		refreshCounts()
+		publish()
+		persist()
+		done({ ok = true, data = { id = id, checked = true } })
+	end)
+end
+
+local function opTaskReopen(args, done)
+	local id = args and args.id
+	if type(id) ~= "string" or id == "" then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "id" } })
+		return
+	end
+	local token = resolveToken()
+	if token == nil then
+		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
+		return
+	end
+	api.reopenTask(token, id, function(r)
+		if not r.ok then
+			if r.err and api.isTransient(r.err.kind) then
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			else
+				done({ ok = false, err = r.err })
+			end
+			return
+		end
+		patchInViews(id, { checked = false })
+		publish()
+		persist()
+		done({ ok = true, data = { id = id, checked = false } })
+		-- It may now belong to a filter view it was removed from, which we
+		-- cannot recompute locally: re-read what the panel is showing.
+		enqueueInternal("tasks.refetch", {})
+	end)
+end
+
 local function handleOp(op, args, done)
 	if op == "ping" then
 		opPing(done)
@@ -524,8 +648,14 @@ local function handleOp(op, args, done)
 		refreshAll(done)
 	elseif op == "tasks.fetch" then
 		fetchOne((args and args.view) or "today", args and args.project_id, args and args.force, done)
+	elseif op == "tasks.refetch" then
+		refetchActive(done)
 	elseif op == "task.create" then
 		opTaskCreate(args, done)
+	elseif op == "task.complete" then
+		opTaskComplete(args, done)
+	elseif op == "task.reopen" then
+		opTaskReopen(args, done)
 	else
 		done({ ok = false, err = { kind = "validation", status = 0, message = "unknown op" } })
 	end
