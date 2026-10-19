@@ -120,10 +120,33 @@ noctalia = {
 		-- Only the request body is ever encoded; keep the text visible so the
 		-- test can assert what was actually sent to Quick Add.
 		encode = function(v)
-			if type(v) == "table" and type(v.text) == "string" then
+			if type(v) ~= "table" then
+				return "@encoded"
+			end
+			if type(v.text) == "string" then
 				return "QADD:" .. v.text
 			end
-			return "@encoded"
+			-- Deterministic key dump (sorted) so tests can assert which fields
+			-- a write carried — e.g. that updateTask stripped project_id.
+			local keys = {}
+			for k in pairs(v) do
+				keys[#keys + 1] = tostring(k)
+			end
+			table.sort(keys)
+			local parts = {}
+			for _, k in ipairs(keys) do
+				local val = v[k]
+				if type(val) == "table" then
+					local xs = {}
+					for _, x in ipairs(val) do
+						xs[#xs + 1] = tostring(x)
+					end
+					parts[#parts + 1] = k .. "=[" .. table.concat(xs, ",") .. "]"
+				else
+					parts[#parts + 1] = k .. "=" .. tostring(val)
+				end
+			end
+			return "@obj{" .. table.concat(parts, ";") .. "}"
 		end,
 		decode = function(s)
 			if s == nil or s == "" then
@@ -211,6 +234,12 @@ local T_OVERDUE = { id = "t1", content = "Pay rent", project_id = "p-home", prio
 local T_TODAY = { id = "t2", content = "Write report", project_id = "p-work", priority = 2, due = DUE, labels = {}, checked = false }
 local T_INBOX = { id = "t3", content = "Read article", project_id = "p-inbox", priority = 1, labels = {}, checked = false }
 
+-- Mutable store backing the Phase 2 (M1) mutation routes below.
+local MUT = {
+	tasks = { m1 = { id = "m1", content = "original", project_id = "p-home", priority = 1, labels = {}, checked = false } },
+	next_id = 0,
+}
+
 local function parseQuery(qs)
 	local params = {}
 	for pair in tostring(qs):gmatch("[^&]+") do
@@ -285,6 +314,54 @@ function route(req)
 			return resp(500, { message = "boom" })
 		end
 		return resp(200, nil) -- server answers 200 with an empty body
+	end
+
+	-- ── Phase 2 (M1) mutation routes ────────────────────────────
+	-- Order matters: the exact /tasks/completed and /tasks/labels paths are
+	-- checked before the generic "/tasks/{id}" pattern, which would otherwise
+	-- swallow them as ids.
+	if method == "GET" and path == "/tasks/completed" then
+		return resp(200, {
+			items = {
+				{ id = "uuid-c1", task_id = "m1", content = "original", completed_at = "2026-10-19T10:00:00Z", project_id = "p-home" },
+			},
+		})
+	end
+
+	if method == "GET" and path == "/labels" then
+		return resp(200, { results = { { id = "l1", name = "errand" }, { id = "l2", name = "home" } } })
+	end
+
+	if method == "POST" and path == "/tasks" then
+		MUT.next_id = MUT.next_id + 1
+		local t = { id = "new-" .. tostring(MUT.next_id), content = "created", priority = 1, labels = {} }
+		MUT.tasks[t.id] = t
+		return resp(200, t)
+	end
+
+	local mtask = path:match("^/tasks/([^/]+)$")
+	local msub, verb = path:match("^/tasks/([^/]+)/(%w+)$")
+
+	if mtask ~= nil and MUT.tasks[mtask] ~= nil then
+		if method == "GET" then
+			return resp(200, MUT.tasks[mtask])
+		end
+		if method == "POST" then
+			return resp(200, { id = mtask, content = "updated", project_id = "p-home", priority = 1, labels = {} })
+		end
+		if method == "DELETE" then
+			MUT.tasks[mtask] = nil
+			return resp(204, nil)
+		end
+	end
+
+	if msub ~= nil and MUT.tasks[msub] ~= nil and method == "POST" then
+		if verb == "close" or verb == "reopen" then
+			return resp(204, nil)
+		end
+		if verb == "move" then
+			return resp(200, { id = msub, project_id = "p-home", section_id = nil })
+		end
 	end
 
 	return resp(404, { message = "no route" })
@@ -724,6 +801,137 @@ check("widget sets a glyph", glyphSet == "checklist", glyphSet)
 check("widget sets a tooltip", tooltipSet == "widget.tooltip", tooltipSet)
 onClick()
 check("widget click toggles panel", #toggled == 1 and toggled[1] == "snowballons/todoist:manager", toggled[1])
+
+-- ── T11: M1 api mutations ───────────────────────────────────────
+print("\n== T11 M1 api mutations ==")
+local api = require("./lib/api.luau")
+
+-- Call an api function with its callback appended, capturing the result.
+-- Bounds are explicit so trailing nils (moveTask with no target) survive.
+local function invoke(fn, ...)
+	local n = select("#", ...)
+	local captured = nil
+	local args = { ... }
+	args[n + 1] = function(r)
+		captured = r
+	end
+	fn(table.unpack(args, 1, n + 1))
+	return captured
+end
+
+-- createTask: POST /tasks, returns the created object (with an id)
+calls = {}
+local created = invoke(api.createTask, "tok", { content = "from api", priority = 4, labels = { "home" } })
+check("createTask ok", created and created.ok == true, created and created.status)
+check("createTask returns an id", created and created.data and created.data.id == "new-1", created and created.data and created.data.id)
+check(
+	"createTask POSTs /tasks (not /tasks/quick)",
+	countCalls(function(c)
+		return c.method == "POST" and c.url:find("/api/v1/tasks", 1, true) ~= nil and c.url:find("/tasks/quick", 1, true) == nil
+	end) == 1,
+	#calls
+)
+check(
+	"createTask sends priority + labels",
+	calls[1] ~= nil and calls[1].body:find("priority=4", 1, true) ~= nil and calls[1].body:find("labels=[home]", 1, true) ~= nil,
+	calls[1] and calls[1].body
+)
+
+calls = {}
+local noContent = invoke(api.createTask, "tok", { priority = 3 })
+check("createTask empty content rejected", noContent and noContent.ok == false and noContent.err.kind == "validation", noContent and noContent.err and noContent.err.kind)
+check("createTask empty content sends no HTTP", #calls == 0, #calls)
+
+-- updateTask: strips project_id/section_id (not update fields), keeps the rest
+calls = {}
+local upd = invoke(api.updateTask, "tok", "m1", { content = "renamed", project_id = "p-work", section_id = "s9", labels = {} })
+check("updateTask ok", upd and upd.ok == true, upd and upd.status)
+check("updateTask returns the object", upd and upd.data and upd.data.id == "m1", upd and upd.data and upd.data.id)
+check("updateTask POSTs /tasks/m1", calls[1] ~= nil and calls[1].method == "POST" and calls[1].url:find("/api/v1/tasks/m1", 1, true) ~= nil, calls[1] and calls[1].url)
+check(
+	"updateTask strips project_id/section_id",
+	calls[1].body:find("project_id", 1, true) == nil and calls[1].body:find("section_id", 1, true) == nil,
+	calls[1].body
+)
+check(
+	"updateTask keeps content + empty labels",
+	calls[1].body:find("content=renamed", 1, true) ~= nil and calls[1].body:find("labels=[]", 1, true) ~= nil,
+	calls[1].body
+)
+
+calls = {}
+local updBad = invoke(api.updateTask, "tok", "m1", { project_id = "p-work" })
+check("updateTask unsupported-only rejected", updBad and updBad.ok == false and updBad.err.kind == "validation", updBad and updBad.err and updBad.err.kind)
+check("updateTask unsupported-only sends no HTTP", #calls == 0, #calls)
+
+-- moveTask
+calls = {}
+local mv = invoke(api.moveTask, "tok", "m1", "p-work", "s1")
+check("moveTask ok", mv and mv.ok == true, mv and mv.status)
+check("moveTask POSTs /tasks/m1/move", calls[1] ~= nil and calls[1].url:find("/api/v1/tasks/m1/move", 1, true) ~= nil, calls[1] and calls[1].url)
+check(
+	"moveTask sends project_id + section_id",
+	calls[1].body:find("project_id=p-work", 1, true) ~= nil and calls[1].body:find("section_id=s1", 1, true) ~= nil,
+	calls[1].body
+)
+
+calls = {}
+local mvBad = invoke(api.moveTask, "tok", "m1", nil, nil)
+check("moveTask without target rejected", mvBad and mvBad.ok == false and mvBad.err.kind == "validation", mvBad and mvBad.err and mvBad.err.kind)
+check("moveTask without target sends no HTTP", #calls == 0, #calls)
+
+-- getTask
+calls = {}
+local got = invoke(api.getTask, "tok", "m1")
+check("getTask ok", got and got.ok == true and got.data and got.data.id == "m1", got and got.status)
+check("getTask GETs /tasks/m1", calls[1] ~= nil and calls[1].method == "GET" and calls[1].url:find("/api/v1/tasks/m1", 1, true) ~= nil, calls[1] and calls[1].url)
+
+-- close / reopen: 204 with no body
+calls = {}
+local cl = invoke(api.closeTask, "tok", "m1")
+check("closeTask ok, 204, no data", cl and cl.ok == true and cl.status == 204 and cl.data == nil, cl and cl.status)
+check("closeTask POSTs /close", calls[1] ~= nil and calls[1].method == "POST" and calls[1].url:find("/tasks/m1/close", 1, true) ~= nil, calls[1] and calls[1].url)
+
+calls = {}
+local ro = invoke(api.reopenTask, "tok", "m1")
+check("reopenTask 204", ro and ro.ok == true and ro.status == 204, ro and ro.status)
+check("reopenTask POSTs /reopen", calls[1] ~= nil and calls[1].url:find("/tasks/m1/reopen", 1, true) ~= nil, calls[1] and calls[1].url)
+
+-- listLabels
+calls = {}
+local labels = invoke(api.listLabels, "tok")
+check("listLabels returns items", labels and labels.ok == true and #labels.items == 2 and labels.items[1].name == "errand", labels and labels.items and #labels.items)
+check("listLabels GETs /labels", calls[1] ~= nil and calls[1].url:find("/api/v1/labels", 1, true) ~= nil, calls[1] and calls[1].url)
+
+-- completedTasks
+calls = {}
+local done = invoke(api.completedTasks, "tok", "2026-10-01T00:00:00Z", "2026-10-20T00:00:00Z")
+check("completedTasks returns items", done and done.ok == true and #done.items == 1, done and done.items and #done.items)
+check("completedTasks item keyed by task_id", done and done.items[1] and done.items[1].task_id == "m1", done and done.items[1] and done.items[1].task_id)
+check(
+	"completedTasks GETs /tasks/completed with since+until",
+	calls[1] ~= nil and calls[1].url:find("/tasks/completed?", 1, true) ~= nil and calls[1].url:find("since=", 1, true) ~= nil and calls[1].url:find("until=", 1, true) ~= nil,
+	calls[1] and calls[1].url
+)
+
+calls = {}
+invoke(api.completedTasks, "tok", "2026-10-01T00:00:00Z", nil)
+check("completedTasks omits until when nil", calls[1] ~= nil and calls[1].url:find("until=", 1, true) == nil, calls[1] and calls[1].url)
+
+-- delete: 204; a following GET is 404 reported as not_found (service folds it)
+calls = {}
+local del = invoke(api.deleteTask, "tok", "m1")
+check("deleteTask ok, 204", del and del.ok == true and del.status == 204, del and del.status)
+check("deleteTask DELETEs /tasks/m1", calls[1] ~= nil and calls[1].method == "DELETE" and calls[1].url:find("/api/v1/tasks/m1", 1, true) ~= nil, calls[1] and calls[1].url)
+
+local gone = invoke(api.getTask, "tok", "m1")
+check("getTask after delete is not_found", gone and gone.ok == false and gone.err.kind == "not_found", gone and gone.err and gone.err.kind)
+
+-- errorMessage extracts the human message from a raw error body
+local err_body = register({ error = "Invalid date", error_code = 20, error_tag = "INVALID_ARGUMENT_VALUE" })
+check("errorMessage extracts .error", api.errorMessage(err_body) == "Invalid date", api.errorMessage(err_body))
+check("errorMessage nil for empty body", api.errorMessage("") == nil)
+check("errorMessage nil for non-json", api.errorMessage("nope") == nil)
 
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)
