@@ -244,4 +244,154 @@ function M.ping(token, cb)
 	M.request(token, "GET", "/projects" .. M.buildQuery({}, nil), nil, cb)
 end
 
+-- ── Phase 2: mutations (contract verified live 2026-10-19) ──────
+-- update / move / close / reopen / delete are idempotent server-side:
+-- repeating the exact call is safe, so the service may retry them once
+-- after a transport failure. Only the two create endpoints are not.
+--
+-- POST /tasks/{id} accepts content, description, priority, due_string,
+-- due_date, due_datetime and labels — NOT project_id or section_id. Sending
+-- either yields 400 error_code 42 "At least one of supported fields should
+-- be set and non-empty" (verified live); moving is its own endpoint. Strip
+-- them here so a caller mistake cannot reach the API.
+local UPDATE_FIELDS = {
+	content = true,
+	description = true,
+	priority = true,
+	due_string = true,
+	due_date = true,
+	due_datetime = true,
+	labels = true,
+}
+
+-- Keep only allow-listed keys that are PRESENT in `changes`. Presence, not
+-- truthiness: `labels = {}` clears labels and `due_string = "no date"` clears
+-- a due date, so an empty/false-ish value must still survive the filter.
+local function pick(changes, allow)
+	local out = {}
+	local n = 0
+	if type(changes) == "table" then
+		for k in pairs(allow) do
+			if changes[k] ~= nil then
+				out[k] = changes[k]
+				n = n + 1
+			end
+		end
+	end
+	return out, n
+end
+
+local function invalid(message)
+	return { ok = false, status = 0, err = { kind = "validation", status = 0, message = message } }
+end
+
+-- Structured create. Unlike quickAdd this returns the new task (with its id).
+-- fields: content (required), project_id, section_id, priority, description,
+-- due_string, labels.
+function M.createTask(token, fields, cb)
+	local body, n = pick(fields, {
+		content = true,
+		project_id = true,
+		section_id = true,
+		priority = true,
+		description = true,
+		due_string = true,
+		labels = true,
+	})
+	if n == 0 or type(body.content) ~= "string" or body.content == "" then
+		cb(invalid("createTask requires a non-empty content"))
+		return
+	end
+	M.request(token, "POST", "/tasks", body, cb)
+end
+
+function M.getTask(token, id, cb)
+	M.request(token, "GET", "/tasks/" .. tostring(id), nil, cb)
+end
+
+-- Partial update; returns the full updated task object (200, not 204).
+function M.updateTask(token, id, changes, cb)
+	local body, n = pick(changes, UPDATE_FIELDS)
+	if n == 0 then
+		cb(invalid("updateTask: no supported fields (content, description, priority, due_string, due_date, due_datetime, labels)"))
+		return
+	end
+	M.request(token, "POST", "/tasks/" .. tostring(id), body, cb)
+end
+
+-- Move to a project and/or section; at least one is required ({} is a 400).
+-- A bare project_id CLEARS the current section (server behaviour) — pass both
+-- to land inside a section. section_id = nil is not a valid way to clear it.
+function M.moveTask(token, id, projectId, sectionId, cb)
+	local body = {}
+	if projectId ~= nil and projectId ~= "" then
+		body.project_id = projectId
+	end
+	if sectionId ~= nil and sectionId ~= "" then
+		body.section_id = sectionId
+	end
+	if body.project_id == nil and body.section_id == nil then
+		cb(invalid("moveTask requires a project_id or section_id"))
+		return
+	end
+	M.request(token, "POST", "/tasks/" .. tostring(id) .. "/move", body, cb)
+end
+
+-- Close / reopen answer 204 with no body. A closed task stays readable:
+-- GET /tasks/{id} returns it with checked=true and completed_at set.
+function M.closeTask(token, id, cb)
+	M.request(token, "POST", "/tasks/" .. tostring(id) .. "/close", nil, cb)
+end
+
+function M.reopenTask(token, id, cb)
+	M.request(token, "POST", "/tasks/" .. tostring(id) .. "/reopen", nil, cb)
+end
+
+-- Delete answers 204; a later GET /tasks/{id} is 404. This wrapper does NOT
+-- fold 404 into success — the service decides that, because for delete a 404
+-- means the task is already gone (success for the user's intent).
+function M.deleteTask(token, id, cb)
+	M.request(token, "DELETE", "/tasks/" .. tostring(id), nil, cb)
+end
+
+-- ── Phase 2: extra reads ────────────────────────────────────────
+function M.listLabels(token, cb)
+	getAll(token, "/labels", {}, cb)
+end
+
+-- Completed tasks in [sinceTs, untilTs). Match results on task_id — the item's
+-- own "id" is an unrelated UUID. Single request: pagination shape here is
+-- unverified, so only since/until are sent (as in the live probe).
+-- ("until" is a Lua keyword, hence sinceTs/untilTs.)
+function M.completedTasks(token, sinceTs, untilTs, cb)
+	local q = "?since=" .. noctalia.string.urlEncode(tostring(sinceTs))
+	if untilTs ~= nil and untilTs ~= "" then
+		q = q .. "&until=" .. noctalia.string.urlEncode(tostring(untilTs))
+	end
+	M.request(token, "GET", "/tasks/completed" .. q, nil, function(r)
+		if not r.ok then
+			cb(r)
+			return
+		end
+		local items = r.data and r.data.items
+		if type(items) ~= "table" then
+			items = {}
+		end
+		cb({ ok = true, status = r.status, items = items })
+	end)
+end
+
+-- Pull the human-readable message out of an error body. `body` is the raw
+-- string api.request puts in err.message. Returns nil when there is none.
+function M.errorMessage(body)
+	if type(body) ~= "string" or body == "" then
+		return nil
+	end
+	local decoded = noctalia.json.decode(body)
+	if type(decoded) == "table" and type(decoded.error) == "string" and decoded.error ~= "" then
+		return decoded.error
+	end
+	return nil
+end
+
 return M
