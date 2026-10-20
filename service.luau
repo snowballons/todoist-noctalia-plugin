@@ -227,13 +227,15 @@ local function reply(sender, seq, op, result)
 	})
 end
 
--- ── retry (GET only) ────────────────────────────────────────────
+-- ── retry ───────────────────────────────────────────────────────
 local function delay(ms, fn)
 	retryTimers[#retryTimers + 1] = { at = noctalia.nowMs() + ms, fn = fn }
 end
 
--- Reads may be replayed safely; callers must never pass a mutating call.
-local function getRetry(fn, cb, attempt)
+-- Reads and idempotent mutations (update/move/close/reopen/delete) may be
+-- replayed safely. task.create must never use this: a retried POST creates a
+-- second task. Create stays single-shot and reconciles instead.
+local function retryTransient(fn, cb, attempt)
 	attempt = attempt or 0
 	fn(function(r)
 		local kind = r.err and r.err.kind
@@ -241,15 +243,35 @@ local function getRetry(fn, cb, attempt)
 			cb(r)
 		else
 			delay(RETRY_DELAY_MS, function()
-				getRetry(fn, cb, attempt + 1)
+				retryTransient(fn, cb, attempt + 1)
 			end)
+		end
+	end)
+end
+
+-- After a mutation whose response was lost, ask the server what is true
+-- instead of replaying the write. cb({ found = true, task = … } | { found =
+-- false } | { failed = true, err = … }). A 404 here is authoritative: the task
+-- is gone (it is not inferred from absence in a list).
+local function confirmTask(token, id, cb)
+	retryTransient(function(c)
+		api.getTask(token, id, c)
+	end, function(r)
+		if r.ok and type(r.data) == "table" and r.data.id ~= nil then
+			cb({ found = true, task = normTask(r.data) })
+		elseif r.ok then
+			cb({ failed = true, err = { kind = "server", status = r.status, message = "bad body" } })
+		elseif r.err and r.err.kind == "not_found" then
+			cb({ found = false })
+		else
+			cb({ failed = true, err = r.err })
 		end
 	end)
 end
 
 -- ── fetching ────────────────────────────────────────────────────
 local function fetchProjects(token, cb)
-	getRetry(function(c)
+	retryTransient(function(c)
 		api.listProjects(token, c)
 	end, function(r)
 		if not r.ok then
@@ -284,7 +306,7 @@ local function fetchView(token, key, spec, cb)
 	end
 
 	if spec.kind == "filter" then
-		getRetry(function(c)
+		retryTransient(function(c)
 			api.filterTasks(token, spec.query, c)
 		end, got)
 	elseif spec.kind == "inbox" then
@@ -293,11 +315,11 @@ local function fetchView(token, key, spec, cb)
 			cb(true) -- no inbox project in this account; nothing to list
 			return
 		end
-		getRetry(function(c)
+		retryTransient(function(c)
 			api.listTasks(token, { project_id = pid }, c)
 		end, got)
 	else
-		getRetry(function(c)
+		retryTransient(function(c)
 			api.listTasks(token, { project_id = spec.project_id }, c)
 		end, got)
 	end
@@ -635,9 +657,8 @@ local function opTaskCreate(args, done)
 	end)
 end
 
--- closeTask answers 204 and is idempotent, so a transient failure leaves the
--- task closed or not — report the doubt rather than guess. (Bounded retry and
--- a confirming GET land with the retry-policy split.)
+-- Idempotent, so it is retried; if the answer is still unknown the confirming
+-- GET decides, and the write is never replayed after that.
 local function opTaskComplete(args, done)
 	local id = args and args.id
 	if type(id) ~= "string" or id == "" then
@@ -649,20 +670,39 @@ local function opTaskComplete(args, done)
 		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
 		return
 	end
-	api.closeTask(token, id, function(r)
-		if not r.ok then
-			if r.err and api.isTransient(r.err.kind) then
-				done({ ok = false, unknown_outcome = true, err = r.err })
-			else
-				done({ ok = false, err = r.err })
-			end
-			return
-		end
+	local function applied(reconciled)
 		removeFromViews(id)
 		refreshCounts()
 		publish()
 		persist()
-		done({ ok = true, data = { id = id, checked = true } })
+		done({ ok = true, data = { id = id, checked = true, reconciled = reconciled } })
+	end
+	retryTransient(function(c)
+		api.closeTask(token, id, c)
+	end, function(r)
+		if r.ok then
+			applied(false)
+			return
+		end
+		if not (r.err and api.isTransient(r.err.kind)) then
+			done({ ok = false, err = r.err })
+			return
+		end
+		confirmTask(token, id, function(c)
+			if c.found == true then
+				if c.task.checked == true then
+					applied(true)
+				else
+					-- The server says it is still open: the write did not land,
+					-- so this is a plain failure the user can retry.
+					done({ ok = false, err = r.err })
+				end
+			elseif c.found == false then
+				done({ ok = false, err = { kind = "not_found", status = 404, message = "task gone" } })
+			else
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			end
+		end)
 	end)
 end
 
@@ -677,22 +717,39 @@ local function opTaskReopen(args, done)
 		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
 		return
 	end
-	api.reopenTask(token, id, function(r)
-		if not r.ok then
-			if r.err and api.isTransient(r.err.kind) then
-				done({ ok = false, unknown_outcome = true, err = r.err })
-			else
-				done({ ok = false, err = r.err })
-			end
+	retryTransient(function(c)
+		api.reopenTask(token, id, c)
+	end, function(r)
+		if not r.ok and not (r.err and api.isTransient(r.err.kind)) then
+			done({ ok = false, err = r.err })
 			return
 		end
-		patchInViews(id, { checked = false })
-		publish()
-		persist()
-		done({ ok = true, data = { id = id, checked = false } })
-		-- It may now belong to a filter view it was removed from, which we
-		-- cannot recompute locally: re-read what the panel is showing.
-		enqueueInternal("tasks.refetch", {})
+		local function applied(reconciled)
+			patchInViews(id, { checked = false })
+			publish()
+			persist()
+			done({ ok = true, data = { id = id, checked = false, reconciled = reconciled } })
+			-- It may now belong to a filter view it was removed from, which we
+			-- cannot recompute locally: re-read what the panel is showing.
+			enqueueInternal("tasks.refetch", {})
+		end
+		if r.ok then
+			applied(false)
+			return
+		end
+		confirmTask(token, id, function(c)
+			if c.found == true then
+				if c.task.checked ~= true then
+					applied(true)
+				else
+					done({ ok = false, err = r.err })
+				end
+			elseif c.found == false then
+				done({ ok = false, err = { kind = "not_found", status = 404, message = "task gone" } })
+			else
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			end
+		end)
 	end)
 end
 
@@ -707,22 +764,36 @@ local function opTaskDelete(args, done)
 		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
 		return
 	end
-	api.deleteTask(token, id, function(r)
-		-- A 404 means the task is already gone: the goal state is reached, so
-		-- do not infer failure from absence. Any other error is real.
-		if not r.ok and not (r.err and r.err.kind == "not_found") then
-			if r.err and api.isTransient(r.err.kind) then
-				done({ ok = false, unknown_outcome = true, err = r.err })
-			else
-				done({ ok = false, err = r.err })
-			end
-			return
-		end
+	local function applied(reconciled)
 		removeFromViews(id)
 		refreshCounts()
 		publish()
 		persist()
-		done({ ok = true, data = { id = id, deleted = true } })
+		done({ ok = true, data = { id = id, deleted = true, reconciled = reconciled } })
+	end
+	retryTransient(function(c)
+		api.deleteTask(token, id, c)
+	end, function(r)
+		-- A 404 means the task is already gone: the goal state is reached, so
+		-- do not infer failure from absence. Any other error is real.
+		if r.ok or (r.err and r.err.kind == "not_found") then
+			applied(false)
+			return
+		end
+		if not (r.err and api.isTransient(r.err.kind)) then
+			done({ ok = false, err = r.err })
+			return
+		end
+		confirmTask(token, id, function(c)
+			if c.found == false then
+				applied(true)
+			elseif c.found == true then
+				-- Still there: the delete did not land.
+				done({ ok = false, err = r.err })
+			else
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			end
+		end)
 	end)
 end
 
@@ -840,24 +911,50 @@ local function opTaskUpdate(args, done)
 		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
 		return
 	end
-	api.updateTask(token, id, send, function(r)
-		-- The response is the full updated task, so it is the truth to render;
-		-- a re-fetch would be a second round trip for the same data.
-		if not r.ok then
-			if r.err and api.isTransient(r.err.kind) then
-				done({ ok = false, unknown_outcome = true, err = r.err })
-			else
-				done({ ok = false, err = r.err })
-			end
-			return
-		end
-		if type(r.data) == "table" and r.data.id ~= nil then
-			replaceInViews(normTask(r.data))
+	local function applied(nt, reconciled)
+		-- The response (or the confirming GET) is the full task, so it is the
+		-- truth to render; a second read would be a round trip for the same data.
+		if nt ~= nil then
+			replaceInViews(nt)
 		end
 		refreshCounts()
 		publish()
 		persist()
-		done({ ok = true, data = { id = id } })
+		done({ ok = true, data = { id = id, reconciled = reconciled } })
+	end
+	local function gone()
+		removeFromViews(id)
+		refreshCounts()
+		publish()
+		persist()
+		done({ ok = false, err = { kind = "not_found", status = 404, message = "task gone" } })
+	end
+	retryTransient(function(c)
+		api.updateTask(token, id, send, c)
+	end, function(r)
+		if r.ok then
+			applied(type(r.data) == "table" and r.data.id ~= nil and normTask(r.data) or nil, false)
+			return
+		end
+		if r.err and r.err.kind == "not_found" then
+			gone()
+			return
+		end
+		if not (r.err and api.isTransient(r.err.kind)) then
+			done({ ok = false, err = r.err })
+			return
+		end
+		confirmTask(token, id, function(c)
+			if c.found == true then
+				-- Render the server's truth; the panel diffs the form against it,
+				-- so anything that did not apply stays visible and actionable.
+				applied(c.task, true)
+			elseif c.found == false then
+				gone()
+			else
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			end
+		end)
 	end)
 end
 
@@ -890,30 +987,61 @@ local function opTaskMove(args, done)
 		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
 		return
 	end
-	-- Pass both whenever a section is known: a bare project_id clears it.
-	api.moveTask(token, id, pid, sid, function(r)
-		if not r.ok then
-			if r.err and api.isTransient(r.err.kind) then
-				done({ ok = false, unknown_outcome = true, err = r.err })
-			else
-				done({ ok = false, err = r.err })
-			end
-			return
-		end
-		local moved = type(r.data) == "table" and r.data.id ~= nil
-		local nt = moved and normTask(r.data) or nil
-		if nt then
+	local function applied(nt, reconciled)
+		if nt ~= nil then
 			replaceInViews(nt)
-			local dest = nt.project_id or pid
-			dropFromForeignProjectViews(id, dest)
+			dropFromForeignProjectViews(id, nt.project_id or pid)
 		end
 		refreshCounts()
 		publish()
 		persist()
-		done({ ok = true, data = { id = id } })
+		done({ ok = true, data = { id = id, reconciled = reconciled } })
 		-- Membership in the destination view (and in the filter views) cannot
 		-- be recomputed locally: re-read what the panel is showing.
 		enqueueInternal("tasks.refetch", {})
+	end
+	-- Pass both whenever a section is known: a bare project_id clears it.
+	retryTransient(function(c)
+		api.moveTask(token, id, pid, sid, c)
+	end, function(r)
+		if r.ok then
+			local nt = type(r.data) == "table" and r.data.id ~= nil and normTask(r.data) or nil
+			applied(nt, false)
+			return
+		end
+		if r.err and r.err.kind == "not_found" then
+			removeFromViews(id)
+			refreshCounts()
+			publish()
+			persist()
+			done({ ok = false, err = { kind = "not_found", status = 404, message = "task gone" } })
+			return
+		end
+		if not (r.err and api.isTransient(r.err.kind)) then
+			done({ ok = false, err = r.err })
+			return
+		end
+		confirmTask(token, id, function(c)
+			if c.found == true then
+				-- A move is only done when the task is actually in the target;
+				-- otherwise the write did not land and the user may retry.
+				local landed = (c.task.project_id == pid)
+					and ((c.task.section_id or nil) == (sid or nil))
+				if landed then
+					applied(c.task, true)
+				else
+					done({ ok = false, err = r.err })
+				end
+			elseif c.found == false then
+				removeFromViews(id)
+				refreshCounts()
+				publish()
+				persist()
+				done({ ok = false, err = { kind = "not_found", status = 404, message = "task gone" } })
+			else
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			end
+		end)
 	end)
 end
 
