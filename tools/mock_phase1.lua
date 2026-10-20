@@ -224,7 +224,24 @@ noctalia = {
 
 -- ── fake Todoist backend ────────────────────────────────────────
 local calls = {}
-local fault = { filter_overdue = false, quick = false, close = false, delete = false, update = false, move = false } -- false | "http500" | "transport" | "404"
+-- false | "http500" | "transport" | "404" | "<kind>_once" | "transport_lost"
+-- A plain fault persists until the test clears it; "_once" fires on the first
+-- call only (so a retry can succeed); "transport_lost" applies the mutation and
+-- then drops the response, which is what the confirming GET has to recover.
+local fault = { filter_overdue = false, quick = false, close = false, reopen = false, delete = false, update = false, move = false }
+
+-- Resolve a fault for this call, clearing one-shot variants.
+local function takeFault(name)
+	local v = fault[name]
+	if v == "transport_once" then
+		fault[name] = false
+		return "transport"
+	elseif v == "http500_once" then
+		fault[name] = false
+		return "http500"
+	end
+	return v
+end
 
 local PROJECTS_P1 = {
 	{ id = "p-inbox", name = "Inbox", inbox_project = true, is_shared = false },
@@ -381,17 +398,21 @@ function route(req)
 	local msub, verb = path:match("^/tasks/([^/]+)/(%w+)$")
 
 	if mtask ~= nil and method == "DELETE" then
-		if fault.delete == "404" then
+		local f = takeFault("delete")
+		if f == "404" then
 			return resp(404, { error = "not found" })
 		end
-		if fault.delete == "http500" then
+		if f == "http500" then
 			return resp(500, { message = "boom" })
 		end
-		if fault.delete == "transport" then
+		if f == "transport" then
 			return resp(0, nil)
 		end
 		if MUT.tasks[mtask] ~= nil then
 			MUT.tasks[mtask] = nil
+			if f == "transport_lost" then
+				return resp(0, nil)
+			end
 			return resp(204, nil)
 		end
 		return resp(404, { error = "not found" })
@@ -402,10 +423,11 @@ function route(req)
 			return resp(200, MUT.tasks[mtask])
 		end
 		if method == "POST" then
-			if fault.update == "http500" then
+			local f = takeFault("update")
+			if f == "http500" then
 				return resp(500, { message = "boom" })
 			end
-			if fault.update == "transport" then
+			if f == "transport" then
 				return resp(0, nil)
 			end
 			-- Merge the sent fields into the stored task and return it whole,
@@ -424,28 +446,56 @@ function route(req)
 					t[k] = v
 				end
 			end
+			if f == "transport_lost" then
+				return resp(0, nil)
+			end
 			return resp(200, t)
 		end
 	end
 
 	if msub ~= nil and method == "POST" then
 		if verb == "close" then
-			if fault.close == "transport" then
+			local f = takeFault("close")
+			if f == "transport" then
 				return resp(0, nil)
 			end
-			if fault.close == "http500" then
+			if f == "http500" then
 				return resp(500, { message = "boom" })
+			end
+			local t = MUT.tasks[msub]
+			if t == nil then
+				return resp(404, { error = "not found" })
+			end
+			t.checked = true
+			if f == "transport_lost" then
+				return resp(0, nil)
 			end
 			return resp(204, nil)
 		end
 		if verb == "reopen" then
+			local f = takeFault("reopen")
+			if f == "transport" then
+				return resp(0, nil)
+			end
+			if f == "http500" then
+				return resp(500, { message = "boom" })
+			end
+			local t = MUT.tasks[msub]
+			if t == nil then
+				return resp(404, { error = "not found" })
+			end
+			t.checked = false
+			if f == "transport_lost" then
+				return resp(0, nil)
+			end
 			return resp(204, nil)
 		end
 		if verb == "move" then
-			if fault.move == "http500" then
+			local f = takeFault("move")
+			if f == "http500" then
 				return resp(500, { message = "boom" })
 			end
-			if fault.move == "transport" then
+			if f == "transport" then
 				return resp(0, nil)
 			end
 			local fields = reqBody(req) or {}
@@ -462,6 +512,9 @@ function route(req)
 				t.section_id = fields.section_id
 			else
 				t.section_id = fields.section_id
+			end
+			if f == "transport_lost" then
+				return resp(0, nil)
 			end
 			return resp(200, t)
 		end
@@ -510,6 +563,15 @@ local function filterCalls(q)
 	return countCalls(function(c)
 		return c.url:find("/tasks/filter", 1, true) ~= nil and c.url:find("query=" .. q, 1, true) ~= nil
 	end)
+end
+
+-- Retries are armed on service timers; advance the clock so update() fires
+-- them. Each pass is one RETRY_DELAY_MS.
+local function drainTimers(passes)
+	for _ = 1, passes or 8 do
+		clock = clock + 2000
+		update()
+	end
 end
 
 -- ── load the service ────────────────────────────────────────────
@@ -1091,16 +1153,22 @@ ev = getState("evt.panel")
 check("complete without token is config", ev ~= nil and ev.ok == false and ev.err.kind == "config", ev and ev.err and ev.err.kind)
 check("complete without token sends no HTTP", #calls == 0, #calls)
 
--- a dropped connection is reported as unknown_outcome, never silently retried
+-- a dropped connection is retried (close is idempotent), then settled by the
+-- confirming GET: the task is still open, so the failure is known, not unknown
 env = { TODOIST_API_TOKEN = "valid-token" }
 calls = {}
 fault.close = "transport"
 fire("cmd.panel", { seq = 105, op = "task.complete", args = { id = "t2" } })
+drainTimers(4)
 ev = getState("evt.panel")
-check("transient close -> unknown_outcome", ev ~= nil and ev.ok == false and ev.unknown_outcome == true, ev and ev.err and ev.err.kind)
-check("transient close is attempted once (no retry in M2)", countCalls(function(c)
+check("transient close settles as a known failure", ev ~= nil and ev.seq == 105 and ev.ok == false and ev.unknown_outcome ~= true, ev and ev.err and ev.err.kind)
+check("transient close is retried (1 + max_retries(1))", countCalls(function(c)
 	return c.method == "POST" and c.url:find("/tasks/t2/close", 1, true) ~= nil
+end) == 2)
+check("transient close issues one confirming GET", countCalls(function(c)
+	return c.method == "GET" and c.url:find("/tasks/t2", 1, true) ~= nil
 end) == 1)
+check("close that did not land keeps the row", getState("todoist").views.today.count == 2, getState("todoist").views.today.count)
 fault.close = false
 
 -- ── T12b: panel checkbox is a live control ──────────────────────
@@ -1223,16 +1291,19 @@ ev = getState("evt.panel")
 check("delete without token is config", ev ~= nil and ev.ok == false and ev.err.kind == "config", ev and ev.err and ev.err.kind)
 check("delete without token sends no HTTP", #calls == 0, #calls)
 
--- a dropped connection: unknown outcome, attempted once
+-- a dropped connection is retried, then the confirming GET finds the task
+-- still there: a known failure, so the row is kept and a retry is safe
 env = { TODOIST_API_TOKEN = "valid-token" }
 calls = {}
 fault.delete = "transport"
-fire("cmd.panel", { seq = 205, op = "task.delete", args = { id = "t2" } })
+fire("cmd.panel", { seq = 205, op = "task.delete", args = { id = "t3" } })
+drainTimers(4)
 ev = getState("evt.panel")
-check("transient delete -> unknown_outcome", ev ~= nil and ev.ok == false and ev.unknown_outcome == true, ev and ev.err and ev.err.kind)
-check("transient delete is attempted once (no retry in M3)", countCalls(function(c)
+check("transient delete settles as a known failure", ev ~= nil and ev.seq == 205 and ev.ok == false and ev.unknown_outcome ~= true, ev and ev.err and ev.err.kind)
+check("transient delete is retried (1 + max_retries(1))", countCalls(function(c)
 	return c.method == "DELETE"
-end) == 1)
+end) == 2)
+check("delete that did not land keeps the row", getState("todoist").views.inbox.count == 1, getState("todoist").views.inbox.count)
 fault.delete = false
 
 -- ── T13b: delete affordance honours confirm_delete ──────────────
@@ -1363,12 +1434,29 @@ ev14 = getState("evt.panel")
 check("project-only update is validation", ev14 ~= nil and ev14.ok == false and ev14.err.kind == "validation", ev14 and ev14.err and ev14.err.kind)
 check("project-only update sends no HTTP", #calls == 0, #calls)
 
--- transient failure: idempotent, so it is an unknown outcome
+-- transient failure: idempotent, so it is retried; the confirming GET then
+-- reconciles to the server's truth (the panel diffs the form against it, so a
+-- change that did not apply stays visible instead of being lost)
 fault.update = "transport"
 calls = {}
 fire("cmd.panel", { seq = 304, op = "task.update", args = { id = "t1", changes = { content = "x" } } })
+drainTimers(4)
 ev14 = getState("evt.panel")
-check("update transport is unknown_outcome", ev14 ~= nil and ev14.ok == false and ev14.unknown_outcome == true, ev14 and ev14.err and ev14.err.kind)
+check("update transport reconciles instead of guessing", ev14 ~= nil and ev14.seq == 304 and ev14.ok == true and ev14.data and ev14.data.reconciled == true, ev14 and ev14.err and ev14.err.kind)
+check("update is retried (1 + max_retries(1))", countCalls(function(c)
+	return c.method == "POST"
+end) == 2)
+check("update issues one confirming GET", countCalls(function(c)
+	return c.method == "GET" and c.url:find("/tasks/t1", 1, true) ~= nil
+end) == 1)
+check("update renders the unchanged server content", (function()
+	for _, t in ipairs(getState("todoist").views.overdue.tasks or {}) do
+		if t.id == "t1" and t.content ~= "x" then
+			return true
+		end
+	end
+	return false
+end)())
 fault.update = false
 
 -- ── T15: task.move (service) ───────────────────────────────────
@@ -1423,11 +1511,20 @@ ev15 = getState("evt.panel")
 check("section without project is validation", ev15 ~= nil and ev15.ok == false and ev15.err.kind == "validation", ev15 and ev15.err and ev15.err.kind)
 check("move guards send no HTTP", #calls == 0, #calls)
 
+-- a lost response is retried; the confirming GET sees t1 still in p-home, so
+-- the move is a known failure and retrying it is safe
 fault.move = "transport"
 calls = {}
 fire("cmd.panel", { seq = 315, op = "task.move", args = { id = "t1", project_id = "p-work" } })
+drainTimers(4)
 ev15 = getState("evt.panel")
-check("move transport is unknown_outcome", ev15 ~= nil and ev15.ok == false and ev15.unknown_outcome == true, ev15 and ev15.err and ev15.err.kind)
+check("move transport settles as a known failure", ev15 ~= nil and ev15.seq == 315 and ev15.ok == false and ev15.unknown_outcome ~= true, ev15 and ev15.err and ev15.err.kind)
+check("move is retried (1 + max_retries(1))", countCalls(function(c)
+	return c.method == "POST"
+end) == 2)
+check("move issues one confirming GET", countCalls(function(c)
+	return c.method == "GET" and c.url:find("/tasks/t1", 1, true) ~= nil
+end) == 1)
 fault.move = false
 
 -- ── T16: edit form (panel) ─────────────────────────────────────
@@ -1662,6 +1759,121 @@ if cancel then
 end
 check("cancel sends nothing", getState("cmd.panel") == nil, getState("cmd.panel") and getState("cmd.panel").op)
 check("cancel returns to the list", not hasLabelText("ui.panel.edit.heading"))
+
+-- ── T17: unknown-outcome recovery (M5) ─────────────────────────
+-- The response is lost but the write landed. With retries disabled, the only
+-- way to learn the truth is the confirming GET: the write is never re-sent.
+print("\n== T17 unknown-outcome recovery ==")
+env = { TODOIST_API_TOKEN = "valid-token" }
+cfg.token = ""
+cfg.token_file = ""
+cfg.max_retries = 0
+fault.close, fault.reopen, fault.update, fault.move, fault.delete, fault.quick =
+	false, false, false, false, false, false
+T_OVERDUE.content, T_OVERDUE.project_id, T_OVERDUE.priority = "Pay rent", "p-home", 4
+T_OVERDUE.checked, T_OVERDUE.section_id, T_OVERDUE.due = false, nil, DUE
+T_TODAY.checked, T_TODAY.project_id, T_TODAY.section_id = false, "p-work", nil
+T_INBOX.checked, T_INBOX.project_id, T_INBOX.section_id = false, "p-inbox", nil
+MUT.tasks.t1, MUT.tasks.t2, MUT.tasks.t3 = T_OVERDUE, T_TODAY, T_INBOX
+loadService()
+update()
+
+-- close: applied, response lost -> GET says checked, so it is done
+calls = {}
+fault.close = "transport_lost"
+fire("cmd.panel", { seq = 401, op = "task.complete", args = { id = "t2" } })
+drainTimers(2)
+ev = getState("evt.panel")
+check("lost close recovers as ok", ev ~= nil and ev.seq == 401 and ev.ok == true and ev.data and ev.data.reconciled == true, ev and ev.err and ev.err.kind)
+check("lost close is sent once (no blind re-send)", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/tasks/t2/close", 1, true) ~= nil
+end) == 1)
+check("lost close asks the server once", countCalls(function(c)
+	return c.method == "GET" and c.url:find("/tasks/t2", 1, true) ~= nil
+end) == 1)
+check("lost close removes the row", getState("todoist").views.today.count == 1, getState("todoist").views.today.count)
+fault.close = false
+
+-- reopen: same shape, mirrored truth check
+T_OVERDUE.checked = true
+calls = {}
+fault.reopen = "transport_lost"
+fire("cmd.panel", { seq = 402, op = "task.reopen", args = { id = "t1" } })
+drainTimers(2)
+ev = getState("evt.panel")
+check("lost reopen recovers as ok", ev ~= nil and ev.seq == 402 and ev.ok == true and ev.data and ev.data.reconciled == true, ev and ev.err and ev.err.kind)
+check("lost reopen is sent once", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/tasks/t1/reopen", 1, true) ~= nil
+end) == 1)
+check("lost reopen asks the server once", countCalls(function(c)
+	return c.method == "GET" and c.url:find("/tasks/t1", 1, true) ~= nil
+end) == 1)
+check("reopen landed on the server", T_OVERDUE.checked == false)
+fault.reopen = false
+drainTimers(2)
+
+-- update: applied, response lost -> the fetched task is rendered
+calls = {}
+fault.update = "transport_lost"
+fire("cmd.panel", { seq = 403, op = "task.update", args = { id = "t1", changes = { content = "Recovered" } } })
+drainTimers(2)
+ev = getState("evt.panel")
+check("lost update recovers as ok", ev ~= nil and ev.seq == 403 and ev.ok == true and ev.data and ev.data.reconciled == true, ev and ev.err and ev.err.kind)
+check("lost update is posted once", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/api/v1/tasks/t1", 1, true) ~= nil
+end) == 1)
+check("lost update renders the server truth", (function()
+	for _, t in ipairs(getState("todoist").views.overdue.tasks or {}) do
+		if t.id == "t1" and t.content == "Recovered" then
+			return true
+		end
+	end
+	return false
+end)())
+fault.update = false
+
+-- move: applied, response lost -> confirm checks the target, not just 200
+calls = {}
+fault.move = "transport_lost"
+fire("cmd.panel", { seq = 404, op = "task.move", args = { id = "t1", project_id = "p-work" } })
+drainTimers(2)
+ev = getState("evt.panel")
+check("lost move recovers as ok", ev ~= nil and ev.seq == 404 and ev.ok == true and ev.data and ev.data.reconciled == true, ev and ev.err and ev.err.kind)
+check("lost move is posted once", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/tasks/t1/move", 1, true) ~= nil
+end) == 1)
+check("lost move landed on the server", T_OVERDUE.project_id == "p-work")
+check("lost move refetches the active view", countCalls(function(c)
+	return c.method == "GET" and c.url:find("/tasks/filter", 1, true) ~= nil
+end) >= 1)
+fault.move = false
+drainTimers(2)
+
+-- delete: applied, response lost -> the confirming 404 is the proof
+calls = {}
+fault.delete = "transport_lost"
+fire("cmd.panel", { seq = 405, op = "task.delete", args = { id = "t3" } })
+drainTimers(2)
+ev = getState("evt.panel")
+check("lost delete recovers as ok", ev ~= nil and ev.seq == 405 and ev.ok == true and ev.data and ev.data.reconciled == true, ev and ev.err and ev.err.kind)
+check("lost delete is sent once", countCalls(function(c)
+	return c.method == "DELETE"
+end) == 1)
+check("lost delete removes the row", getState("todoist").views.inbox.count == 0, getState("todoist").views.inbox.count)
+fault.delete = false
+
+-- create is exempt even with a retry budget: a retried POST duplicates
+cfg.max_retries = 3
+calls = {}
+fault.quick = "transport"
+fire("cmd.panel", { seq = 406, op = "task.create", args = { text = "Only once" } })
+drainTimers(6)
+ev = getState("evt.panel")
+check("create never retries, even with max_retries=3", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/tasks/quick", 1, true) ~= nil
+end) == 1)
+check("create stays an unknown outcome", ev ~= nil and ev.seq == 406 and ev.ok == false and ev.unknown_outcome == true, ev and ev.err and ev.err.kind)
+fault.quick = false
 
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)
