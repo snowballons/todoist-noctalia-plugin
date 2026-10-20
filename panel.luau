@@ -23,6 +23,7 @@ local snap = {}
 local open = false
 local mode = "list" -- "list" | "projects"
 local highlightId = nil
+local confirmDeleteId = nil -- task id awaiting a delete confirmation
 local statusText = nil
 local statusKind = nil -- nil | "ok" | "err" | "warn"
 local quickText = ""
@@ -224,6 +225,61 @@ local function toggleTask(t)
 	end
 end
 
+-- Delete is idempotent, so re-sending is safe; the panel leaves that to the
+-- service and only issues the op once.
+local function deleteNow(id)
+	if client.busy() then
+		return
+	end
+	highlightId = id
+	if client.send("task.delete", { id = id }) then
+		confirmDeleteId = nil
+		render()
+	end
+end
+
+local function requestDelete(t)
+	if client.busy() then
+		return
+	end
+	local id = tostring(t.id)
+	if noctalia.getConfig("confirm_delete") == false then
+		deleteNow(id)
+		return
+	end
+	confirmDeleteId = id
+	render()
+end
+
+local function confirmRow(t)
+	return ui.row({
+		gap = 6,
+		align = "center",
+		key = "del" .. tostring(t.id),
+		paddingV = 4,
+		fill = true,
+	}, {
+		ui.label({ text = noctalia.tr("ui.panel.delete.confirm", { content = t.content }), flexGrow = 1, maxLines = 2, color = DANGER }),
+		ui.button({
+			text = noctalia.tr("ui.panel.delete.yes"),
+			variant = "destructive",
+			controlSize = "sm",
+			onClick = function()
+				deleteNow(tostring(t.id))
+			end,
+		}),
+		ui.button({
+			text = noctalia.tr("ui.panel.delete.no"),
+			variant = "ghost",
+			controlSize = "sm",
+			onClick = function()
+				confirmDeleteId = nil
+				render()
+			end,
+		}),
+	})
+end
+
 local function taskRow(t)
 	local rowItems = {}
 
@@ -285,6 +341,16 @@ local function taskRow(t)
 			setStatus("ok", noctalia.tr("ui.panel.link_copied"))
 		end,
 	})
+	rowItems[#rowItems + 1] = ui.button({
+		glyph = "trash",
+		variant = "ghost",
+		controlSize = "sm",
+		tooltip = noctalia.tr("ui.panel.delete"),
+		enabled = not client.busy(),
+		onClick = function()
+			requestDelete(t)
+		end,
+	})
 
 	return ui.row({
 		gap = 6,
@@ -305,7 +371,11 @@ local function taskList()
 	end
 	local rows = {}
 	for _, t in ipairs(tasks) do
-		rows[#rows + 1] = taskRow(t)
+		if confirmDeleteId ~= nil and tostring(t.id) == confirmDeleteId then
+			rows[#rows + 1] = confirmRow(t)
+		else
+			rows[#rows + 1] = taskRow(t)
+		end
 	end
 	return ui.scroll({
 		flexGrow = 1,
@@ -488,7 +558,7 @@ noctalia.state.watch("evt.panel", function(msg)
 			noctalia.notifyError(noctalia.tr("notify.failed"), errText(msg.err))
 		end
 		render()
-	elseif op == "task.complete" or op == "task.reopen" then
+	elseif op == "task.complete" or op == "task.reopen" or op == "task.delete" then
 		if msg.ok then
 			snap.error = nil
 			statusKind, statusText = nil, nil

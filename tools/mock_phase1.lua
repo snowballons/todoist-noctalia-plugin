@@ -43,7 +43,7 @@ end
 
 -- ── stub noctalia ───────────────────────────────────────────────
 local env = {}
-local cfg = { token = "", token_file = "", max_retries = 1, cache_tasks = false, default_project = "", default_labels = {}, default_priority = "none" }
+local cfg = { token = "", token_file = "", max_retries = 1, cache_tasks = false, confirm_delete = true, default_project = "", default_labels = {}, default_priority = "none" }
 local log_lines = {}
 local notified = {}
 local runasync = {}
@@ -220,7 +220,7 @@ noctalia = {
 
 -- ── fake Todoist backend ────────────────────────────────────────
 local calls = {}
-local fault = { filter_overdue = false, quick = false, close = false } -- false | "http500" | "transport"
+local fault = { filter_overdue = false, quick = false, close = false, delete = false } -- false | "http500" | "transport" | "404"
 
 local PROJECTS_P1 = {
 	{ id = "p-inbox", name = "Inbox", inbox_project = true, is_shared = false },
@@ -342,16 +342,29 @@ function route(req)
 	local mtask = path:match("^/tasks/([^/]+)$")
 	local msub, verb = path:match("^/tasks/([^/]+)/(%w+)$")
 
+	if mtask ~= nil and method == "DELETE" then
+		if fault.delete == "404" then
+			return resp(404, { error = "not found" })
+		end
+		if fault.delete == "http500" then
+			return resp(500, { message = "boom" })
+		end
+		if fault.delete == "transport" then
+			return resp(0, nil)
+		end
+		if MUT.tasks[mtask] ~= nil then
+			MUT.tasks[mtask] = nil
+			return resp(204, nil)
+		end
+		return resp(404, { error = "not found" })
+	end
+
 	if mtask ~= nil and MUT.tasks[mtask] ~= nil then
 		if method == "GET" then
 			return resp(200, MUT.tasks[mtask])
 		end
 		if method == "POST" then
 			return resp(200, { id = mtask, content = "updated", project_id = "p-home", priority = 1, labels = {} })
-		end
-		if method == "DELETE" then
-			MUT.tasks[mtask] = nil
-			return resp(204, nil)
 		end
 	end
 
@@ -1074,6 +1087,132 @@ if toggle2 then
 end
 cmd = getState("cmd.panel")
 check("clicking a closed task sends task.reopen", cmd ~= nil and cmd.op == "task.reopen" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
+
+-- ── T13: M3 task.delete + confirm_delete ────────────────────────
+print("\n== T13 delete ==")
+env = { TODOIST_API_TOKEN = "valid-token" }
+cfg.token = ""
+cfg.token_file = ""
+cfg.max_retries = 1
+fault.delete = false
+calls = {}
+loadService()
+update()
+local s13 = getState("todoist")
+check("T13 setup: today holds 2", s13.views.today.count == 2, s13.views.today.count)
+
+calls = {}
+fire("cmd.panel", { seq = 201, op = "task.delete", args = { id = "t1" } })
+ev = getState("evt.panel")
+check("delete reply ok", ev ~= nil and ev.seq == 201 and ev.ok == true, ev and ev.err and ev.err.kind)
+check("delete reply carries data.deleted", ev ~= nil and type(ev.data) == "table" and ev.data.deleted == true and ev.data.id == "t1")
+check("delete sends DELETE /tasks/t1", countCalls(function(c)
+	return c.method == "DELETE" and c.url:find("/tasks/t1", 1, true) ~= nil
+end) == 1)
+check("delete makes no extra request", #calls == 1, #calls)
+check("t1 gone from overdue", s13.views.overdue.count == 0, s13.views.overdue.count)
+check("t1 gone from today, t2 kept", s13.views.today.count == 1 and s13.views.today.tasks[1].id == "t2", s13.views.today.count)
+check("t1 gone from p1", s13.views.p1.count == 0, s13.views.p1.count)
+check("delete recomputes counts", s13.counts.overdue == 0 and s13.counts.today == 1, tostring(s13.counts.today))
+
+-- 404 means the task is already gone: the goal state, not a failure
+calls = {}
+fault.delete = "404"
+fire("cmd.panel", { seq = 202, op = "task.delete", args = { id = "t2" } })
+ev = getState("evt.panel")
+check("404 on delete is treated as success", ev ~= nil and ev.ok == true, ev and ev.err and ev.err.kind)
+check("404 delete still reconciles locally", s13.views.today.count == 0, s13.views.today.count)
+fault.delete = false
+
+-- guards
+calls = {}
+fire("cmd.panel", { seq = 203, op = "task.delete", args = {} })
+ev = getState("evt.panel")
+check("delete without id is validation", ev ~= nil and ev.ok == false and ev.err.kind == "validation", ev and ev.err and ev.err.kind)
+check("delete without id sends no HTTP", #calls == 0, #calls)
+
+env = {}
+cfg.token = ""
+cfg.token_file = ""
+calls = {}
+fire("cmd.panel", { seq = 204, op = "task.delete", args = { id = "t2" } })
+ev = getState("evt.panel")
+check("delete without token is config", ev ~= nil and ev.ok == false and ev.err.kind == "config", ev and ev.err and ev.err.kind)
+check("delete without token sends no HTTP", #calls == 0, #calls)
+
+-- a dropped connection: unknown outcome, attempted once
+env = { TODOIST_API_TOKEN = "valid-token" }
+calls = {}
+fault.delete = "transport"
+fire("cmd.panel", { seq = 205, op = "task.delete", args = { id = "t2" } })
+ev = getState("evt.panel")
+check("transient delete -> unknown_outcome", ev ~= nil and ev.ok == false and ev.unknown_outcome == true, ev and ev.err and ev.err.kind)
+check("transient delete is attempted once (no retry in M3)", countCalls(function(c)
+	return c.method == "DELETE"
+end) == 1)
+fault.delete = false
+
+-- ── T13b: delete affordance honours confirm_delete ──────────────
+print("\n== T13b confirm_delete ==")
+local function fakeTask(checked)
+	return {
+		schema = 1,
+		token_configured = true,
+		view = "inbox",
+		tasks = { { id = "t3", content = "Inbox task", p = 4, url = "u", checked = checked } },
+		views = { inbox = { tasks = { { id = "t3", content = "Inbox task", p = 4, url = "u", checked = checked } }, count = 1 } },
+		projects = {},
+		counts = {},
+		defaults = {},
+		fetched_at = 0,
+	}
+end
+
+cfg.confirm_delete = true
+state_store["open_task"] = nil
+state_store["todoist"] = fakeTask(false)
+onOpen({})
+settlePanel()
+local trash = findButton(function(props)
+	return props.glyph == "trash"
+end)
+check("row exposes a delete button", trash ~= nil)
+state_store["cmd.panel"] = nil
+if trash then
+	trash.props.onClick()
+end
+check("confirmation on: delete waits for confirmation", getState("cmd.panel") == nil, getState("cmd.panel") and getState("cmd.panel").op)
+local no = findButton(function(props)
+	return props.text == "ui.panel.delete.no"
+end)
+local yes = findButton(function(props)
+	return props.text == "ui.panel.delete.yes"
+end)
+check("confirmation on: confirm row offers Delete and Cancel", yes ~= nil and no ~= nil)
+state_store["cmd.panel"] = nil
+if yes then
+	yes.props.onClick()
+end
+cmd = getState("cmd.panel")
+check("confirming sends task.delete", cmd ~= nil and cmd.op == "task.delete" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
+
+cfg.confirm_delete = false
+state_store["todoist"] = fakeTask(false)
+onOpen({})
+settlePanel()
+local trash2 = findButton(function(props)
+	return props.glyph == "trash"
+end)
+state_store["cmd.panel"] = nil
+if trash2 then
+	trash2.props.onClick()
+end
+cmd = getState("cmd.panel")
+check("confirmation off: delete is sent immediately", cmd ~= nil and cmd.op == "task.delete" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
+check("confirmation off: no confirm row", findButton(function(props)
+	return props.text == "ui.panel.delete.no"
+end) == nil)
+cfg.confirm_delete = true
 
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)

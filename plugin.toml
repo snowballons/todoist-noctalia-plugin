@@ -58,6 +58,13 @@ description_key = "settings.cache_tasks.description"
 default = false
 
 [[setting]]
+key = "confirm_delete"
+type = "bool"
+label_key = "settings.confirm_delete.label"
+description_key = "settings.confirm_delete.description"
+default = true
+
+[[setting]]
 key = "max_retries"
 type = "int"
 label_key = "settings.max_retries.label"
