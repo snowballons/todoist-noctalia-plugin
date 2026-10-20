@@ -115,6 +115,10 @@ local snapshot = {
 	inbox_project_id = nil,
 	counts = {},
 	defaults = {},
+	labels = {},
+	labels_at = nil,
+	sections = {}, -- project_id -> { { id, name, child_order } }
+	sections_at = {}, -- project_id -> stamp
 	error = nil,
 }
 
@@ -482,21 +486,27 @@ end
 -- actionable work only. Reopening is the reverse, but a filter view cannot be
 -- recomputed locally, so the caller re-fetches instead of guessing.
 
+local function dropFromView(v, id)
+	local kept, hit = {}, false
+	for _, t in ipairs(v.tasks) do
+		if t.id == id then
+			hit = true
+		else
+			kept[#kept + 1] = t
+		end
+	end
+	if hit then
+		v.tasks = kept
+		v.count = #kept
+	end
+	return hit
+end
+
 local function removeFromViews(id)
 	local any = false
 	for _, v in pairs(snapshot.views) do
 		if type(v) == "table" and type(v.tasks) == "table" then
-			local kept, hit = {}, false
-			for _, t in ipairs(v.tasks) do
-				if t.id == id then
-					hit = true
-				else
-					kept[#kept + 1] = t
-				end
-			end
-			if hit then
-				v.tasks = kept
-				v.count = #kept
+			if dropFromView(v, id) then
 				any = true
 			end
 		end
@@ -507,6 +517,46 @@ local function removeFromViews(id)
 		setActiveView(snapshot.view)
 	end
 	return any
+end
+
+-- Swap a task for the object the server just returned. The row keeps its
+-- position inside each view, so no re-sort and no membership guess.
+local function replaceInViews(t)
+	local any = false
+	for _, v in pairs(snapshot.views) do
+		if type(v) == "table" and type(v.tasks) == "table" then
+			for i, cur in ipairs(v.tasks) do
+				if cur.id == t.id then
+					v.tasks[i] = t
+					any = true
+				end
+			end
+		end
+	end
+	if any then
+		setActiveView(snapshot.view)
+	end
+	return any
+end
+
+-- After a move, a task no longer belongs to the cached view of any other
+-- project (or to inbox). Filter views and the destination are left alone.
+local function dropFromForeignProjectViews(id, pid)
+	local any = false
+	for key, v in pairs(snapshot.views) do
+		if type(v) == "table" and type(v.tasks) == "table" then
+			local owner = key:match("^project:(.+)$")
+			if key == "inbox" then
+				owner = snapshot.inbox_project_id
+			end
+			if owner ~= nil and owner ~= pid and dropFromView(v, id) then
+				any = true
+			end
+		end
+	end
+	if any then
+		setActiveView(snapshot.view)
+	end
 end
 
 local function patchInViews(id, patch)
@@ -676,6 +726,197 @@ local function opTaskDelete(args, done)
 	end)
 end
 
+-- Labels and the sections of one project, for the edit form's pickers.
+-- Fetched lazily (the form is the only consumer) and cached for the same
+-- window as the project list.
+local function opMetaLoad(args, done)
+	local token = resolveToken()
+	if token == nil then
+		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
+		return
+	end
+	local pid = args and args.project_id
+	if type(pid) ~= "string" or pid == "" then
+		pid = nil
+	end
+
+	local function finish(err)
+		publish()
+		done({ ok = err == nil, err = err, data = { project_id = pid } })
+	end
+
+	local function loadSections()
+		if pid == nil then
+			finish(nil)
+			return
+		end
+		local at = snapshot.sections_at[pid]
+		if at and (noctalia.nowMs() - at) < PROJECTS_TTL_MS then
+			finish(nil)
+			return
+		end
+		api.listSections(token, pid, function(r)
+			if not r.ok then
+				finish(r.err)
+				return
+			end
+			local out = {}
+			for _, s in ipairs(r.items or {}) do
+				out[#out + 1] = { id = s.id, name = s.name or "", child_order = s.child_order }
+			end
+			table.sort(out, function(a, b)
+				return (a.child_order or 0) < (b.child_order or 0)
+			end)
+			snapshot.sections[pid] = out
+			snapshot.sections_at[pid] = noctalia.nowMs()
+			finish(nil)
+		end)
+	end
+
+	if snapshot.labels_at and (noctalia.nowMs() - snapshot.labels_at) < PROJECTS_TTL_MS then
+		loadSections()
+		return
+	end
+	api.listLabels(token, function(r)
+		if not r.ok then
+			-- Labels are a convenience for the picker; the form still works
+			-- without them, so do not fail the load or stamp the cache.
+			loadSections()
+			return
+		end
+		local out = {}
+		for _, l in ipairs(r.items or {}) do
+			out[#out + 1] = { id = l.id, name = l.name or "" }
+		end
+		table.sort(out, function(a, b)
+			return a.name < b.name
+		end)
+		snapshot.labels = out
+		snapshot.labels_at = noctalia.nowMs()
+		loadSections()
+	end)
+end
+
+local UPDATE_IGNORED = { project_id = true, section_id = true }
+
+local function opTaskUpdate(args, done)
+	local id = args and args.id
+	if type(id) ~= "string" or id == "" then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "id" } })
+		return
+	end
+	local changes = args and args.changes
+	if type(changes) ~= "table" then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "changes" } })
+		return
+	end
+	-- Moving is a separate endpoint; the API rejects these fields here.
+	local send, n = {}, 0
+	for k, v in pairs(changes) do
+		if not UPDATE_IGNORED[k] then
+			send[k] = v
+			n = n + 1
+		end
+	end
+	if n == 0 then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "changes" } })
+		return
+	end
+	if send.content ~= nil and (type(send.content) ~= "string" or noctalia.string.trim(send.content) == "") then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "content" } })
+		return
+	end
+	if send.priority ~= nil then
+		-- The API accepts an out-of-range priority and silently drops it.
+		local pr = tonumber(send.priority)
+		if pr == nil or pr % 1 ~= 0 or pr < 1 or pr > 4 then
+			done({ ok = false, err = { kind = "validation", status = 0, message = "priority" } })
+			return
+		end
+		send.priority = pr
+	end
+	local token = resolveToken()
+	if token == nil then
+		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
+		return
+	end
+	api.updateTask(token, id, send, function(r)
+		-- The response is the full updated task, so it is the truth to render;
+		-- a re-fetch would be a second round trip for the same data.
+		if not r.ok then
+			if r.err and api.isTransient(r.err.kind) then
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			else
+				done({ ok = false, err = r.err })
+			end
+			return
+		end
+		if type(r.data) == "table" and r.data.id ~= nil then
+			replaceInViews(normTask(r.data))
+		end
+		refreshCounts()
+		publish()
+		persist()
+		done({ ok = true, data = { id = id } })
+	end)
+end
+
+local function opTaskMove(args, done)
+	local id = args and args.id
+	if type(id) ~= "string" or id == "" then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "id" } })
+		return
+	end
+	local pid = args and args.project_id
+	if type(pid) ~= "string" or pid == "" then
+		pid = nil
+	end
+	local sid = args and args.section_id
+	if type(sid) ~= "string" or sid == "" then
+		sid = nil
+	end
+	-- moveTask needs at least one target, and a section only exists inside a
+	-- project. Both are rejected before spending a request.
+	if pid == nil and sid == nil then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "target" } })
+		return
+	end
+	if pid == nil then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "section without project" } })
+		return
+	end
+	local token = resolveToken()
+	if token == nil then
+		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
+		return
+	end
+	-- Pass both whenever a section is known: a bare project_id clears it.
+	api.moveTask(token, id, pid, sid, function(r)
+		if not r.ok then
+			if r.err and api.isTransient(r.err.kind) then
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			else
+				done({ ok = false, err = r.err })
+			end
+			return
+		end
+		local moved = type(r.data) == "table" and r.data.id ~= nil
+		local nt = moved and normTask(r.data) or nil
+		if nt then
+			replaceInViews(nt)
+			local dest = nt.project_id or pid
+			dropFromForeignProjectViews(id, dest)
+		end
+		refreshCounts()
+		publish()
+		persist()
+		done({ ok = true, data = { id = id } })
+		-- Membership in the destination view (and in the filter views) cannot
+		-- be recomputed locally: re-read what the panel is showing.
+		enqueueInternal("tasks.refetch", {})
+	end)
+end
+
 local function handleOp(op, args, done)
 	if op == "ping" then
 		opPing(done)
@@ -685,8 +926,14 @@ local function handleOp(op, args, done)
 		fetchOne((args and args.view) or "today", args and args.project_id, args and args.force, done)
 	elseif op == "tasks.refetch" then
 		refetchActive(done)
+	elseif op == "meta.load" then
+		opMetaLoad(args, done)
 	elseif op == "task.create" then
 		opTaskCreate(args, done)
+	elseif op == "task.update" then
+		opTaskUpdate(args, done)
+	elseif op == "task.move" then
+		opTaskMove(args, done)
 	elseif op == "task.complete" then
 		opTaskComplete(args, done)
 	elseif op == "task.reopen" then
