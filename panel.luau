@@ -21,13 +21,20 @@ local client = state.new("panel")
 
 local snap = {}
 local open = false
-local mode = "list" -- "list" | "projects"
+local mode = "list" -- "list" | "projects" | "edit"
 local highlightId = nil
 local confirmDeleteId = nil -- task id awaiting a delete confirmation
 local statusText = nil
 local statusKind = nil -- nil | "ok" | "err" | "warn"
 local quickText = ""
 local quickKey = 0
+
+-- Edit form. Every keystroke lands in `edit`, so re-seeding an input (which
+-- needs a new key) never loses in-progress text.
+local editId = nil
+local edit = nil
+local editKey = 0
+local editErr = nil
 
 -- Forward declaration: callbacks defined above render() below.
 local render
@@ -44,6 +51,23 @@ local function projectName(id)
 		end
 	end
 	return nil
+end
+
+-- ui.select is 0-based for both selectedIndex and the onChange value; the
+-- panel keeps 1-based indices and converts at the boundary.
+local function selIdx(raw, n)
+	local i = tonumber(raw)
+	if i == nil then
+		return 1
+	end
+	i = math.floor(i)
+	if i < 0 then
+		return 1
+	end
+	if i < n then
+		return i + 1
+	end
+	return n
 end
 
 local function setStatus(kind, text)
@@ -280,6 +304,8 @@ local function confirmRow(t)
 	})
 end
 
+local openEdit -- defined with the edit form below; the row's pencil calls it
+
 local function taskRow(t)
 	local rowItems = {}
 
@@ -339,6 +365,16 @@ local function taskRow(t)
 		onClick = function()
 			noctalia.copyToClipboard(t.url or "", "text/plain")
 			setStatus("ok", noctalia.tr("ui.panel.link_copied"))
+		end,
+	})
+	rowItems[#rowItems + 1] = ui.button({
+		glyph = "pencil",
+		variant = "ghost",
+		controlSize = "sm",
+		tooltip = noctalia.tr("ui.panel.edit.open"),
+		enabled = not client.busy(),
+		onClick = function()
+			openEdit(t)
 		end,
 	})
 	rowItems[#rowItems + 1] = ui.button({
@@ -404,9 +440,426 @@ local function projectList()
 	return ui.scroll({ flexGrow = 1, fill = true }, rows)
 end
 
+-- ── edit form ───────────────────────────────────────────────────
+local function findTask(id)
+	if id == nil then
+		return nil
+	end
+	id = tostring(id)
+	for _, t in ipairs(snap.tasks or {}) do
+		if tostring(t.id) == id then
+			return t
+		end
+	end
+	for _, v in pairs(snap.views or {}) do
+		if type(v) == "table" and type(v.tasks) == "table" then
+			for _, t in ipairs(v.tasks) do
+				if tostring(t.id) == id then
+					return t
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function dueRaw(due)
+	if type(due) ~= "table" then
+		return ""
+	end
+	return due.string or due.date or ""
+end
+
+local function splitLabels(text)
+	local out, seen = {}, {}
+	for part in tostring(text or ""):gmatch("[^,]+") do
+		local name = noctalia.string.trim(part)
+		if name ~= "" and not seen[name] then
+			seen[name] = true
+			out[#out + 1] = name
+		end
+	end
+	return out
+end
+
+local function sameSet(a, b)
+	local function key(list)
+		local t = {}
+		for _, v in ipairs(list or {}) do
+			t[tostring(v)] = true
+		end
+		return t
+	end
+	local ka, kb = key(a), key(b)
+	for k in pairs(ka) do
+		if not kb[k] then
+			return false
+		end
+	end
+	for k in pairs(kb) do
+		if not ka[k] then
+			return false
+		end
+	end
+	return true
+end
+
+local function projectOptions()
+	local out = {}
+	for _, p in ipairs(snap.projects or {}) do
+		out[#out + 1] = { id = p.id, name = p.name or "" }
+	end
+	table.sort(out, function(a, b)
+		local ai = a.id == snap.inbox_project_id
+		local bi = b.id == snap.inbox_project_id
+		if ai ~= bi then
+			return ai
+		end
+		return a.name:lower() < b.name:lower()
+	end)
+	return out
+end
+
+local function knownLabelNames()
+	local out = {}
+	for _, l in ipairs(snap.labels or {}) do
+		if type(l.name) == "string" and l.name ~= "" then
+			out[#out + 1] = l.name
+		end
+	end
+	return out
+end
+
+local function priorityLabels()
+	return {
+		noctalia.tr("priority.p1"),
+		noctalia.tr("priority.p2"),
+		noctalia.tr("priority.p3"),
+		noctalia.tr("priority.p4"),
+	}
+end
+
+openEdit = function(t)
+	if t == nil or client.busy() then
+		return
+	end
+	editId = tostring(t.id)
+	editKey = editKey + 1
+	editErr = nil
+	edit = {
+		content = t.content or "",
+		description = t.description or "",
+		priority = tonumber(t.p) or 4,
+		due = dueRaw(t.due),
+		project_id = t.project_id,
+		section_id = t.section_id,
+		labelsText = table.concat(t.labels or {}, ", "),
+	}
+	mode = "edit"
+	-- Populate the label and section pickers for this project.
+	client.send("meta.load", { project_id = t.project_id })
+	render()
+end
+
+local function closeEdit()
+	editId = nil
+	edit = nil
+	editErr = nil
+	mode = "list"
+	render()
+end
+
+-- Re-read the task from the snapshot after a mutation. Returns false when it
+-- is gone (deleted elsewhere), which the caller turns into a close.
+local function reseedEdit()
+	local t = findTask(editId)
+	if t == nil then
+		return false
+	end
+	edit.content = t.content or ""
+	edit.description = t.description or ""
+	edit.priority = tonumber(t.p) or 4
+	edit.due = dueRaw(t.due)
+	edit.project_id = t.project_id
+	edit.section_id = t.section_id
+	edit.labelsText = table.concat(t.labels or {}, ", ")
+	-- Re-seed the inputs, which only happens on a new key.
+	editKey = editKey + 1
+	return true
+end
+
+-- Only the fields that actually differ are sent. Priority crosses the client
+-- (1 = highest) / API (4 = highest) boundary here.
+local function editDiff()
+	local t = findTask(editId)
+	if t == nil or edit == nil then
+		return {}, false
+	end
+	local c = {}
+	local content = noctalia.string.trim(edit.content or "")
+	if content ~= (t.content or "") and content ~= "" then
+		c.content = content
+	end
+	local desc = edit.description or ""
+	if desc ~= (t.description or "") then
+		c.description = desc
+	end
+	local p = tonumber(edit.priority) or 4
+	if p ~= (tonumber(t.p) or 4) then
+		c.priority = 5 - p
+	end
+	local due = edit.due or ""
+	if due ~= dueRaw(t.due) then
+		c.due_string = (due == "") and "no date" or due
+	end
+	if not sameSet(splitLabels(edit.labelsText), t.labels) then
+		c.labels = splitLabels(edit.labelsText)
+	end
+	local moved = (edit.project_id ~= t.project_id)
+		or ((edit.section_id or nil) ~= (t.section_id or nil))
+	return c, moved
+end
+
+local function saveEdit()
+	if edit == nil or editId == nil or client.busy() then
+		return
+	end
+	if noctalia.string.trim(edit.content or "") == "" then
+		editErr = noctalia.tr("ui.panel.edit.content_required")
+		render()
+		return
+	end
+	local c, moved = editDiff()
+	if next(c) == nil then
+		if moved then
+			return -- the Move button owns project/section
+		end
+		closeEdit()
+		return
+	end
+	editErr = nil
+	if client.send("task.update", { id = editId, changes = c }) then
+		render()
+	end
+end
+
+local function moveEdit()
+	if edit == nil or editId == nil or client.busy() then
+		return
+	end
+	local _, moved = editDiff()
+	if not moved then
+		return
+	end
+	editErr = nil
+	if client.send("task.move", { id = editId, project_id = edit.project_id, section_id = edit.section_id }) then
+		render()
+	end
+end
+
+local function editForm()
+	if edit == nil then
+		return ui.label({ text = "" })
+	end
+
+	local items = {}
+	items[#items + 1] = ui.label({
+		text = noctalia.tr("ui.panel.edit.heading"),
+		fontSize = 14,
+		fontWeight = "bold",
+		maxLines = 1,
+	})
+
+	items[#items + 1] = ui.input({
+		key = "ec" .. tostring(editKey),
+		value = edit.content,
+		placeholder = noctalia.tr("ui.panel.edit.content"),
+		onChange = function(v)
+			edit.content = v or ""
+		end,
+	})
+
+	items[#items + 1] = ui.label({ text = noctalia.tr("ui.panel.edit.description") })
+	items[#items + 1] = ui.input({
+		key = "ed" .. tostring(editKey),
+		value = edit.description,
+		multiline = true,
+		placeholder = noctalia.tr("ui.panel.edit.description_ph"),
+		onChange = function(v)
+			edit.description = v or ""
+		end,
+	})
+
+	local popts = priorityLabels()
+	local pidx = math.max(1, math.min(4, tonumber(edit.priority) or 4))
+	items[#items + 1] = ui.row({ gap = 8 }, {
+		ui.column({ flexGrow = 1 }, {
+			ui.label({ text = noctalia.tr("ui.panel.edit.priority") }),
+			ui.select({
+				options = popts,
+				selectedIndex = pidx - 1,
+				onChange = function(v)
+					edit.priority = selIdx(v, #popts)
+					render()
+				end,
+			}),
+		}),
+		ui.column({ flexGrow = 2 }, {
+			ui.label({ text = noctalia.tr("ui.panel.edit.due") }),
+			ui.row({ gap = 4, align = "center" }, {
+				ui.input({
+					key = "edu" .. tostring(editKey),
+					value = edit.due,
+					placeholder = noctalia.tr("ui.panel.edit.due_ph"),
+					flexGrow = 1,
+					onChange = function(v)
+						edit.due = v or ""
+					end,
+				}),
+				ui.button({
+					glyph = "x",
+					variant = "ghost",
+					controlSize = "sm",
+					tooltip = noctalia.tr("ui.panel.edit.clear_due"),
+					onClick = function()
+						edit.due = ""
+						editKey = editKey + 1
+						render()
+					end,
+				}),
+			}),
+		}),
+	})
+
+	local projects = projectOptions()
+	local psel = 1
+	for i, p in ipairs(projects) do
+		if p.id == edit.project_id then
+			psel = i
+			break
+		end
+	end
+	local pnames = {}
+	for i, p in ipairs(projects) do
+		pnames[i] = (p.id == snap.inbox_project_id) and ("[Inbox]  " .. p.name) or p.name
+	end
+	if #pnames == 0 then
+		pnames = { noctalia.tr("ui.panel.edit.no_project") }
+	end
+
+	local secs = (edit.project_id and snap.sections and snap.sections[edit.project_id]) or {}
+	local sopts = { noctalia.tr("ui.panel.edit.no_section") }
+	local ssel = 1
+	for i, s in ipairs(secs) do
+		sopts[#sopts + 1] = s.name
+		if s.id == edit.section_id then
+			ssel = i + 1
+		end
+	end
+
+	items[#items + 1] = ui.row({ gap = 8 }, {
+		ui.column({ flexGrow = 1 }, {
+			ui.label({ text = noctalia.tr("ui.panel.edit.project") }),
+			ui.select({
+				options = pnames,
+				selectedIndex = psel - 1,
+				onChange = function(v)
+					local i = selIdx(v, #projects)
+					local picked = projects[i]
+					if picked ~= nil then
+						edit.project_id = picked.id
+						-- A section belongs to one project: never carry it over.
+						edit.section_id = nil
+						client.send("meta.load", { project_id = picked.id })
+						render()
+					end
+				end,
+			}),
+		}),
+		ui.column({ flexGrow = 1 }, {
+			ui.label({ text = noctalia.tr("ui.panel.edit.section") }),
+			ui.select({
+				options = sopts,
+				selectedIndex = ssel - 1,
+				enabled = #secs > 0,
+				onChange = function(v)
+					local i = selIdx(v, #sopts)
+					edit.section_id = secs[i - 1] and secs[i - 1].id or nil
+					render()
+				end,
+			}),
+		}),
+	})
+	if #secs == 0 then
+		items[#items + 1] = ui.label({
+			text = noctalia.tr("ui.panel.edit.no_sections"),
+			fontSize = 11,
+			color = MUTED,
+			maxLines = 1,
+		})
+	end
+
+	items[#items + 1] = ui.label({ text = noctalia.tr("ui.panel.edit.labels") })
+	items[#items + 1] = ui.input({
+		key = "el" .. tostring(editKey),
+		value = edit.labelsText,
+		placeholder = noctalia.tr("ui.panel.edit.labels_ph"),
+		onChange = function(v)
+			edit.labelsText = v or ""
+		end,
+	})
+	local known = knownLabelNames()
+	if #known > 0 then
+		items[#items + 1] = ui.label({
+			text = noctalia.tr("ui.panel.edit.labels_known", { labels = table.concat(known, ", ") }),
+			fontSize = 11,
+			color = MUTED,
+			maxLines = 2,
+		})
+	end
+
+	if editErr then
+		items[#items + 1] = ui.label({ text = editErr, color = DANGER, maxLines = 2 })
+	end
+
+	items[#items + 1] = ui.row({ gap = 6, align = "center" }, {
+		ui.button({
+			text = noctalia.tr("ui.panel.edit.save"),
+			variant = "primary",
+			controlSize = "sm",
+			-- Text inputs are uncontrolled and do not re-render on every keystroke,
+			-- so a diff-driven `enabled` would stay false while typing. Gate on the
+			-- in-flight command only; the handlers no-op when nothing changed.
+			enabled = not client.busy(),
+			onClick = saveEdit,
+		}),
+		ui.button({
+			text = noctalia.tr("ui.panel.edit.move"),
+			variant = "secondary",
+			controlSize = "sm",
+			enabled = not client.busy(),
+			onClick = moveEdit,
+		}),
+		ui.button({
+			text = noctalia.tr("ui.panel.edit.cancel"),
+			variant = "ghost",
+			controlSize = "sm",
+			enabled = not client.busy(),
+			onClick = closeEdit,
+		}),
+	})
+
+	return ui.scroll({ flexGrow = 1, fill = true }, {
+		ui.column({ gap = 8 }, items),
+	})
+end
+
 local function body()
 	if snap.token_configured == false then
 		return ui.label({ text = noctalia.tr("ui.panel.not_configured"), color = DANGER, maxLines = 3 })
+	end
+	if mode == "edit" then
+		return editForm()
 	end
 	if mode == "projects" then
 		return projectList()
@@ -433,6 +886,12 @@ local function footer()
 	end
 	if banner then
 		items[#items + 1] = banner
+	end
+
+	-- While editing, the footer is just the banner: quick-add would post a new
+	-- task while the user is working on an existing one.
+	if mode == "edit" then
+		return ui.column({ gap = 8 }, items)
 	end
 
 	items[#items + 1] = ui.row({ gap = 6, align = "center" }, {
@@ -505,13 +964,16 @@ defaultsSummary = function()
 end
 
 render = function()
-	panel.render(ui.column({ gap = 10, padding = 12 }, {
-		header(),
-		tiles(),
-		nav(),
-		body(),
-		footer(),
-	}))
+	local items = { header() }
+	-- The form takes the whole body: navigation and the quick-add footer would
+	-- only compete with it for space.
+	if mode ~= "edit" then
+		items[#items + 1] = tiles()
+		items[#items + 1] = nav()
+	end
+	items[#items + 1] = body()
+	items[#items + 1] = footer()
+	panel.render(ui.column({ gap = 10, padding = 12 }, items))
 end
 
 -- ── protocol ────────────────────────────────────────────────────
@@ -569,6 +1031,39 @@ noctalia.state.watch("evt.panel", function(msg)
 			client.send("tasks.refresh", {})
 		else
 			setStatus("err", errText(msg.err))
+		end
+		render()
+	elseif op == "task.update" or op == "task.move" then
+		if msg.ok then
+			snap.error = nil
+			statusKind, statusText = nil, nil
+			if editId ~= nil then
+				-- The service already replaced the row from the server object;
+				-- re-read it so the form shows the truth and its buttons agree.
+				if reseedEdit() then
+					local changes, moved = editDiff()
+					if next(changes) == nil and not moved then
+						closeEdit()
+					else
+						render()
+					end
+				else
+					closeEdit()
+				end
+			else
+				render()
+			end
+		elseif msg.unknown_outcome then
+			setStatus("warn", noctalia.tr("err.unknown_outcome_refresh"))
+			client.send("tasks.refresh", {})
+		else
+			editErr = errText(msg.err)
+			setStatus("err", editErr)
+		end
+		render()
+	elseif op == "meta.load" then
+		if not msg.ok then
+			setStatus("warn", errText(msg.err))
 		end
 		render()
 	elseif op == "tasks.fetch" or op == "tasks.refresh" then

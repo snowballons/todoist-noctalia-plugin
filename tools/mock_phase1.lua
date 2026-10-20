@@ -146,7 +146,11 @@ noctalia = {
 					parts[#parts + 1] = k .. "=" .. tostring(val)
 				end
 			end
-			return "@obj{" .. table.concat(parts, ";") .. "}"
+			local enc = "@obj{" .. table.concat(parts, ";") .. "}"
+			-- Keep encode/decode symmetric so the backend can read a request
+			-- body back as the table the caller built.
+			body_map[enc] = v
+			return enc
 		end,
 		decode = function(s)
 			if s == nil or s == "" then
@@ -220,7 +224,7 @@ noctalia = {
 
 -- ── fake Todoist backend ────────────────────────────────────────
 local calls = {}
-local fault = { filter_overdue = false, quick = false, close = false, delete = false } -- false | "http500" | "transport" | "404"
+local fault = { filter_overdue = false, quick = false, close = false, delete = false, update = false, move = false } -- false | "http500" | "transport" | "404"
 
 local PROJECTS_P1 = {
 	{ id = "p-inbox", name = "Inbox", inbox_project = true, is_shared = false },
@@ -236,9 +240,32 @@ local T_INBOX = { id = "t3", content = "Read article", project_id = "p-inbox", p
 
 -- Mutable store backing the Phase 2 (M1) mutation routes below.
 local MUT = {
-	tasks = { m1 = { id = "m1", content = "original", project_id = "p-home", priority = 1, labels = {}, checked = false } },
+	tasks = {
+		m1 = { id = "m1", content = "original", project_id = "p-home", priority = 1, labels = {}, checked = false },
+		-- Aliases (not copies): the filter routes serve these same tables, so a
+		-- mutation is visible to a subsequent refetch, like the real API.
+		t1 = T_OVERDUE,
+		t2 = T_TODAY,
+		t3 = T_INBOX,
+	},
 	next_id = 0,
 }
+
+-- Sections belong to one project; the API filters by project_id.
+local SECTIONS = {
+	{ id = "s-home-chores", project_id = "p-home", name = "Chores", child_order = 1 },
+	{ id = "s-work-todo", project_id = "p-work", name = "To do", child_order = 1 },
+	{ id = "s-work-later", project_id = "p-work", name = "Later", child_order = 2 },
+}
+
+-- The request body as the caller's table (json.decode resolves through the
+-- same map json.encode registered it in).
+local function reqBody(req)
+	if req.body == nil or req.body == "" then
+		return nil
+	end
+	return body_map[req.body]
+end
 
 local function parseQuery(qs)
 	local params = {}
@@ -332,6 +359,17 @@ function route(req)
 		return resp(200, { results = { { id = "l1", name = "errand" }, { id = "l2", name = "home" } } })
 	end
 
+	if method == "GET" and path == "/sections" then
+		local pid = params.project_id
+		local out = {}
+		for _, s in ipairs(SECTIONS) do
+			if pid == nil or s.project_id == pid then
+				out[#out + 1] = s
+			end
+		end
+		return resp(200, { results = out })
+	end
+
 	if method == "POST" and path == "/tasks" then
 		MUT.next_id = MUT.next_id + 1
 		local t = { id = "new-" .. tostring(MUT.next_id), content = "created", priority = 1, labels = {} }
@@ -364,7 +402,29 @@ function route(req)
 			return resp(200, MUT.tasks[mtask])
 		end
 		if method == "POST" then
-			return resp(200, { id = mtask, content = "updated", project_id = "p-home", priority = 1, labels = {} })
+			if fault.update == "http500" then
+				return resp(500, { message = "boom" })
+			end
+			if fault.update == "transport" then
+				return resp(0, nil)
+			end
+			-- Merge the sent fields into the stored task and return it whole,
+			-- as the real endpoint does.
+			local fields = reqBody(req) or {}
+			local t = MUT.tasks[mtask]
+			for k, v in pairs(fields) do
+				if k == "due_string" then
+					-- The API resolves the phrase; a cleared date is "no date".
+					if v == "no date" then
+						t.due = nil
+					else
+						t.due = { date = "2026-11-01", string = v }
+					end
+				else
+					t[k] = v
+				end
+			end
+			return resp(200, t)
 		end
 	end
 
@@ -382,7 +442,28 @@ function route(req)
 			return resp(204, nil)
 		end
 		if verb == "move" then
-			return resp(200, { id = msub, project_id = "p-home", section_id = nil })
+			if fault.move == "http500" then
+				return resp(500, { message = "boom" })
+			end
+			if fault.move == "transport" then
+				return resp(0, nil)
+			end
+			local fields = reqBody(req) or {}
+			if fields.project_id == nil and fields.section_id == nil then
+				return resp(400, { error = "No project_id or section_id or parent_id specified", error_code = 42 })
+			end
+			local t = MUT.tasks[msub]
+			if t == nil then
+				return resp(404, { error = "not found" })
+			end
+			if fields.project_id ~= nil then
+				t.project_id = fields.project_id
+				-- A bare project_id clears the section (server behaviour).
+				t.section_id = fields.section_id
+			else
+				t.section_id = fields.section_id
+			end
+			return resp(200, t)
 		end
 	end
 
@@ -1215,6 +1296,372 @@ check("confirmation off: no confirm row", findButton(function(props)
 	return props.text == "ui.panel.delete.no"
 end) == nil)
 cfg.confirm_delete = true
+
+-- ── T14: task.update (service) ─────────────────────────────────
+print("\n== T14 task.update ==")
+env = { TODOIST_API_TOKEN = "valid-token" }
+cfg.max_retries = 1
+fault.update = false
+MUT.tasks.t1 = T_OVERDUE
+MUT.tasks.t2 = T_TODAY
+loadService()
+update()
+local s14 = getState("todoist")
+check("T14 setup: today holds 2", s14.views.today.count == 2, s14.views.today.count)
+
+calls = {}
+fire("cmd.panel", {
+	seq = 301,
+	op = "task.update",
+	args = { id = "t1", changes = { content = "Pay more", priority = 2, labels = { "home", "new" }, project_id = "p-work" } },
+})
+local ev14 = getState("evt.panel")
+check("update reply ok", ev14 ~= nil and ev14.seq == 301 and ev14.ok == true, ev14 and ev14.err and ev14.err.kind)
+check("update POSTs /tasks/t1", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/api/v1/tasks/t1", 1, true) ~= nil
+end) == 1)
+check(
+	"update strips project_id/section_id",
+	calls[1] ~= nil and calls[1].body:find("project_id", 1, true) == nil and calls[1].body:find("section_id", 1, true) == nil,
+	calls[1] and calls[1].body
+)
+check(
+	"update sends content/priority/labels",
+	calls[1] ~= nil
+		and calls[1].body:find("content=Pay more", 1, true) ~= nil
+		and calls[1].body:find("priority=2", 1, true) ~= nil
+		and calls[1].body:find("labels=[home,new]", 1, true) ~= nil,
+	calls[1] and calls[1].body
+)
+check("update makes exactly one request", #calls == 1, #calls)
+
+local row14 = nil
+for _, t in ipairs(s14.tasks or {}) do
+	if t.id == "t1" then
+		row14 = t
+	end
+end
+check(
+	"update reconciled the row from the response",
+	row14 ~= nil and row14.content == "Pay more" and row14.p == 3,
+	row14 and (tostring(row14.content) .. "/" .. tostring(row14.p))
+)
+check("update did not move the task", row14 ~= nil and row14.project_id == "p-home", row14 and row14.project_id)
+check("update kept the other row", s14.views.today.count == 2, s14.views.today.count)
+
+-- an out-of-range priority is refused before any request (the API drops it)
+calls = {}
+fire("cmd.panel", { seq = 302, op = "task.update", args = { id = "t1", changes = { priority = 9 } } })
+ev14 = getState("evt.panel")
+check("priority 9 is validation", ev14 ~= nil and ev14.ok == false and ev14.err.kind == "validation", ev14 and ev14.err and ev14.err.kind)
+check("priority 9 sends no HTTP", #calls == 0, #calls)
+
+-- a move-only payload contains no supported update field
+calls = {}
+fire("cmd.panel", { seq = 303, op = "task.update", args = { id = "t1", changes = { project_id = "p-work" } } })
+ev14 = getState("evt.panel")
+check("project-only update is validation", ev14 ~= nil and ev14.ok == false and ev14.err.kind == "validation", ev14 and ev14.err and ev14.err.kind)
+check("project-only update sends no HTTP", #calls == 0, #calls)
+
+-- transient failure: idempotent, so it is an unknown outcome
+fault.update = "transport"
+calls = {}
+fire("cmd.panel", { seq = 304, op = "task.update", args = { id = "t1", changes = { content = "x" } } })
+ev14 = getState("evt.panel")
+check("update transport is unknown_outcome", ev14 ~= nil and ev14.ok == false and ev14.unknown_outcome == true, ev14 and ev14.err and ev14.err.kind)
+fault.update = false
+
+-- ── T15: task.move (service) ───────────────────────────────────
+print("\n== T15 task.move ==")
+env = { TODOIST_API_TOKEN = "valid-token" }
+fault.move = false
+MUT.tasks.t1 = T_OVERDUE
+MUT.tasks.t2 = T_TODAY
+MUT.tasks.t3 = T_INBOX
+loadService()
+update() -- overdue=1, today=2, p1=1, inbox=1
+local s15 = getState("todoist")
+check("T15 setup: inbox holds t3", s15.views.inbox ~= nil and s15.views.inbox.count == 1, s15.views.inbox and s15.views.inbox.count)
+
+calls = {}
+fire("cmd.panel", { seq = 311, op = "task.move", args = { id = "t3", project_id = "p-work", section_id = "s-work-todo" } })
+local ev15 = getState("evt.panel")
+check("move reply ok", ev15 ~= nil and ev15.seq == 311 and ev15.ok == true, ev15 and ev15.err and ev15.err.kind)
+check("move POSTs /tasks/t3/move", countCalls(function(c)
+	return c.method == "POST" and c.url:find("/api/v1/tasks/t3/move", 1, true) ~= nil
+end) == 1)
+check(
+	"move sends project_id + section_id",
+	calls[1] ~= nil and calls[1].body:find("project_id=p-work", 1, true) ~= nil and calls[1].body:find("section_id=s-work-todo", 1, true) ~= nil,
+	calls[1] and calls[1].body
+)
+check("move left the source (inbox) view", s15.views.inbox.count == 0 and #s15.views.inbox.tasks == 0, s15.views.inbox.count)
+check("move re-fetched the active view", filterCalls("today") == 1, filterCalls("today"))
+
+-- a bare project clears the section: the server response is the truth
+calls = {}
+fire("cmd.panel", { seq = 312, op = "task.move", args = { id = "t2", project_id = "p-home" } })
+ev15 = getState("evt.panel")
+check("move to a project only is ok", ev15 ~= nil and ev15.ok == true, ev15 and ev15.err and ev15.err.kind)
+check("bare project sends no section_id", calls[1] ~= nil and calls[1].body:find("section_id", 1, true) == nil, calls[1] and calls[1].body)
+local moved15 = nil
+for _, t in ipairs(s15.views.today.tasks) do
+	if t.id == "t2" then
+		moved15 = t
+	end
+end
+check("moved row shows the new project", moved15 ~= nil and moved15.project_id == "p-home", moved15 and moved15.project_id)
+check("moved row has no section", moved15 ~= nil and moved15.section_id == nil, moved15 and moved15.section_id)
+
+-- guards: neither target, or a section without a project, never reaches HTTP
+calls = {}
+fire("cmd.panel", { seq = 313, op = "task.move", args = { id = "t1" } })
+ev15 = getState("evt.panel")
+check("move without target is validation", ev15 ~= nil and ev15.ok == false and ev15.err.kind == "validation", ev15 and ev15.err and ev15.err.kind)
+fire("cmd.panel", { seq = 314, op = "task.move", args = { id = "t1", section_id = "s-home-chores" } })
+ev15 = getState("evt.panel")
+check("section without project is validation", ev15 ~= nil and ev15.ok == false and ev15.err.kind == "validation", ev15 and ev15.err and ev15.err.kind)
+check("move guards send no HTTP", #calls == 0, #calls)
+
+fault.move = "transport"
+calls = {}
+fire("cmd.panel", { seq = 315, op = "task.move", args = { id = "t1", project_id = "p-work" } })
+ev15 = getState("evt.panel")
+check("move transport is unknown_outcome", ev15 ~= nil and ev15.ok == false and ev15.unknown_outcome == true, ev15 and ev15.err and ev15.err.kind)
+fault.move = false
+
+-- ── T16: edit form (panel) ─────────────────────────────────────
+print("\n== T16 edit form ==")
+state_store["open_task"] = nil
+local function findInput(pred)
+	local found = nil
+	local function rec(n)
+		if type(n) ~= "table" then
+			return
+		end
+		if n.kind == "input" and pred(n.props) then
+			found = n
+		end
+		for _, c in ipairs(n.children or {}) do
+			rec(c)
+		end
+	end
+	rec(rendered)
+	return found
+end
+local function findSelect(pred)
+	local found = nil
+	local function rec(n)
+		if type(n) ~= "table" then
+			return
+		end
+		if n.kind == "select" and pred(n.props) then
+			found = n
+		end
+		for _, c in ipairs(n.children or {}) do
+			rec(c)
+		end
+	end
+	rec(rendered)
+	return found
+end
+local function hasLabelText(text)
+	local found = false
+	local function rec(n)
+		if type(n) ~= "table" then
+			return
+		end
+		if n.kind == "label" and n.props.text == text then
+			found = true
+		end
+		for _, c in ipairs(n.children or {}) do
+			rec(c)
+		end
+	end
+	rec(rendered)
+	return found
+end
+local function freshTask(over)
+	local t = {
+		id = "t1",
+		content = "Pay rent",
+		description = "old note",
+		p = 1,
+		project_id = "p-home",
+		section_id = "s-home-chores",
+		labels = { "home" },
+		due = { date = "2026-10-10", string = "Oct 10" },
+		url = "u",
+	}
+	for k, v in pairs(over or {}) do
+		t[k] = v
+	end
+	return t
+end
+local function editSnapshot(over)
+	local t = freshTask(over)
+	return {
+		schema = 1,
+		token_configured = true,
+		view = "today",
+		tasks = { t },
+		views = { today = { tasks = { t }, count = 1 } },
+		projects = {
+			{ id = "p-inbox", name = "Inbox", inbox = true },
+			{ id = "p-home", name = "Home" },
+			{ id = "p-work", name = "Work" },
+		},
+		inbox_project_id = "p-inbox",
+		counts = { today = 1 },
+		defaults = {},
+		fetched_at = 0,
+		labels = { { id = "l1", name = "errand" }, { id = "l2", name = "home" } },
+		sections = { ["p-home"] = { { id = "s-home-chores", name = "Chores" } } },
+		sections_at = {},
+	}
+end
+
+state_store["todoist"] = editSnapshot()
+onOpen({})
+settlePanel()
+local pencil = findButton(function(props)
+	return props.glyph == "pencil"
+end)
+check("row exposes an edit button", pencil ~= nil)
+state_store["cmd.panel"] = nil
+if pencil then
+	pencil.props.onClick()
+end
+local mcmd = getState("cmd.panel")
+check("opening the form loads labels and sections", mcmd ~= nil and mcmd.op == "meta.load" and mcmd.args and mcmd.args.project_id == "p-home", mcmd and mcmd.op)
+check("form shows its heading", hasLabelText("ui.panel.edit.heading"))
+check("form seeds the title", findInput(function(p)
+	return p.value == "Pay rent"
+end) ~= nil)
+check("form seeds the due date", findInput(function(p)
+	return p.value == "Oct 10"
+end) ~= nil)
+settlePanel()
+
+-- editing the title sends only that field
+local titleInput = findInput(function(p)
+	return p.value == "Pay rent"
+end)
+if titleInput then
+	titleInput.props.onChange("Pay rent now")
+end
+state_store["cmd.panel"] = nil
+local save = findButton(function(p)
+	return p.text == "ui.panel.edit.save"
+end)
+check("save is available while idle", save ~= nil and save.props.enabled == true, save and tostring(save.props.enabled))
+if save then
+	save.props.onClick()
+end
+local ucmd = getState("cmd.panel")
+check(
+	"save sends task.update with only the changed field",
+	ucmd ~= nil and ucmd.op == "task.update" and ucmd.args and ucmd.args.changes and ucmd.args.changes.content == "Pay rent now",
+	ucmd and ucmd.op
+)
+check(
+	"save sends no untouched fields",
+	ucmd ~= nil and ucmd.args and ucmd.args.changes and ucmd.args.changes.priority == nil and ucmd.args.changes.project_id == nil,
+	ucmd and ucmd.args and ucmd.args.changes and tostring(ucmd.args.changes.priority)
+)
+
+-- the service publishes, then replies: the form closes with nothing left
+state_store["todoist"] = editSnapshot({ content = "Pay rent now" })
+fire("todoist", state_store["todoist"])
+fire("evt.panel", { seq = ucmd.seq, op = "task.update", ok = true, data = { id = "t1" } })
+check("form closes when the diff is gone", not hasLabelText("ui.panel.edit.heading"))
+
+-- Clear sends "no date"
+local pencil2 = findButton(function(props)
+	return props.glyph == "pencil"
+end)
+if pencil2 then
+	pencil2.props.onClick()
+end
+settlePanel()
+local clearDue = findButton(function(props)
+	return props.tooltip == "ui.panel.edit.clear_due"
+end)
+check("form offers a clear-due button", clearDue ~= nil)
+if clearDue then
+	clearDue.props.onClick()
+end
+state_store["cmd.panel"] = nil
+local save2 = findButton(function(p)
+	return p.text == "ui.panel.edit.save"
+end)
+if save2 then
+	save2.props.onClick()
+end
+local dcmd = getState("cmd.panel")
+check(
+	"clearing the due date sends due_string = no date",
+	dcmd ~= nil and dcmd.op == "task.update" and dcmd.args and dcmd.args.changes and dcmd.args.changes.due_string == "no date",
+	dcmd and dcmd.args and dcmd.args.changes and dcmd.args.changes.due_string
+)
+settlePanel()
+
+-- changing the project resets the section and reloads it
+local pencil3 = findButton(function(props)
+	return props.glyph == "pencil"
+end)
+if pencil3 then
+	pencil3.props.onClick()
+end
+settlePanel()
+local projSelect = findSelect(function(p)
+	return type(p.options) == "table" and p.options[1] == "[Inbox]  Inbox"
+end)
+check("form has a project picker", projSelect ~= nil)
+state_store["cmd.panel"] = nil
+if projSelect then
+	projSelect.props.onChange(2) -- 0-based: Work
+end
+local mcmd2 = getState("cmd.panel")
+check(
+	"changing the project reloads its sections",
+	mcmd2 ~= nil and mcmd2.op == "meta.load" and mcmd2.args and mcmd2.args.project_id == "p-work",
+	mcmd2 and mcmd2.args and mcmd2.args.project_id
+)
+settlePanel()
+state_store["cmd.panel"] = nil
+local moveBtn = findButton(function(p)
+	return p.text == "ui.panel.edit.move"
+end)
+check("move is available while idle", moveBtn ~= nil and moveBtn.props.enabled == true, moveBtn and tostring(moveBtn.props.enabled))
+if moveBtn then
+	moveBtn.props.onClick()
+end
+local mvcmd = getState("cmd.panel")
+check(
+	"move sends the project and the reset section",
+	mvcmd ~= nil and mvcmd.op == "task.move" and mvcmd.args and mvcmd.args.project_id == "p-work" and mvcmd.args.section_id == nil,
+	mvcmd and mvcmd.op
+)
+settlePanel()
+
+-- cancel discards without sending anything
+local pencil4 = findButton(function(props)
+	return props.glyph == "pencil"
+end)
+if pencil4 then
+	pencil4.props.onClick()
+end
+settlePanel()
+state_store["cmd.panel"] = nil
+local cancel = findButton(function(p)
+	return p.text == "ui.panel.edit.cancel"
+end)
+if cancel then
+	cancel.props.onClick()
+end
+check("cancel sends nothing", getState("cmd.panel") == nil, getState("cmd.panel") and getState("cmd.panel").op)
+check("cancel returns to the list", not hasLabelText("ui.panel.edit.heading"))
 
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)

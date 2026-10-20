@@ -5,7 +5,10 @@
 # ~/.config/todoist/token, override with $TODOIST_TOKEN_FILE). It is never
 # echoed, never passed as an argument, and never written to a temp file.
 #
-# Creates two tasks with Quick Add and deletes them again at the end.
+# Phase 1: creates two tasks with Quick Add and deletes them again.
+# Phase 2: create -> update -> move -> close -> reopen -> delete, verifying that
+# every mutation response is the full object we render, plus /sections, /labels
+# and the completed-items path. Everything it creates is deleted on exit.
 #
 # Usage:
 #   ./tools/smoke-todoist.sh
@@ -127,6 +130,96 @@ hit=[p for c,p in prio.items() if 'urgent' in c]
 print('  urgent task API priority:', hit[0] if hit else 'not found', '(4 = P1 -> client p1)')"
 
 say "10. cleanup runs on exit (DELETE /tasks/{id})"
+echo "  to delete: ${CREATED[*]:-none}"
+
+say "11. GET /labels (expect 200 + results[])"
+code=$(status "${H[@]}" "$API/labels")
+echo "HTTP $code"
+curl -sS "${H[@]}" "$API/labels" | python3 -c "import json,sys
+d=json.load(sys.stdin)
+rs=d.get('results') or d.get('items') or []
+print('  labels:', len(rs), '| first:', rs[0]['name'] if rs else '(none)')"
+
+say "12. POST /tasks create (expect 200 + the task object with an id)"
+INBOX=$(curl -sS "${H[@]}" "$API/projects" | python3 -c "import json,sys
+d=json.load(sys.stdin); rs=d.get('results') or d.get('items') or []
+print(next((p['id'] for p in rs if p.get('inbox_project')), next((p['id'] for p in rs if p['name'].lower() == 'inbox'), rs[0]['id'] if rs else '')))")
+if [ -z "$INBOX" ]; then echo "FAIL: no project to create into"; exit 1; fi
+RESP=$(curl -sS -X POST "${H[@]}" "$API/tasks" \
+  -d "{\"content\":\"$MARK mutation\",\"project_id\":\"$INBOX\",\"priority\":1}")
+TID=$(echo "$RESP" | python3 -c "import json,sys
+d=json.load(sys.stdin); print(d.get('id') or '')")
+echo "  id: ${TID:-<none>} | priority: $(echo "$RESP" | python3 -c "import json,sys;print(json.load(sys.stdin).get('priority'))")"
+[ -n "$TID" ] || { echo "FAIL: create returned no id"; exit 1; }
+CREATED+=("$TID")
+
+say "13. POST /tasks/{id} update content+priority+labels (expect 200 + full object)"
+RESP=$(curl -sS -X POST "${H[@]}" "$API/tasks/$TID" \
+  -d "{\"content\":\"$MARK updated\",\"description\":\"note\",\"priority\":4,\"labels\":[\"smoke\"]}")
+echo "$RESP" | python3 -c "import json,sys
+d=json.load(sys.stdin)
+print('  content:', d.get('content'))
+print('  priority:', d.get('priority'), '(4 = P1 in the UI)')
+print('  labels:', d.get('labels'))
+print('  description:', d.get('description'))"
+
+say "14. update with due_string=no date clears it (expect due = None)"
+curl -sS -X POST "${H[@]}" "$API/tasks/$TID" -d '{"due_string":"tomorrow"}' >/dev/null
+curl -sS -X POST "${H[@]}" "$API/tasks/$TID" -d '{"due_string":"no date"}' | python3 -c "import json,sys
+d=json.load(sys.stdin); print('  due:', d.get('due'))"
+
+say "15. update rejects project_id (expect 400 + error_code 42)"
+code=$(status -X POST "${H[@]}" "$API/tasks/$TID" -d "{\"project_id\":\"$INBOX\"}")
+echo "HTTP $code (move changes the project instead)"
+curl -sS -X POST "${H[@]}" "$API/tasks/$TID" -d "{\"project_id\":\"$INBOX\"}" | python3 -c "import json,sys
+d=json.load(sys.stdin); print('  error_code:', d.get('error_code'))" 2>/dev/null || true
+
+say "16. POST /tasks/{id}/move (expect 200; a bare project_id clears the section)"
+TARGET=$(curl -sS "${H[@]}" "$API/projects" | python3 -c "import json,sys
+d=json.load(sys.stdin); rs=d.get('results') or d.get('items') or []
+print(next((p['id'] for p in rs if not p.get('is_inbox_project')), ''))")
+if [ -n "$TARGET" ]; then
+  echo "  target project: $TARGET"
+  curl -sS -X POST "${H[@]}" "$API/tasks/$TID/move" -d "{\"project_id\":\"$TARGET\"}" | python3 -c "import json,sys
+d=json.load(sys.stdin); print('  project_id:', d.get('project_id'), '| section_id:', d.get('section_id'))"
+  echo "  sections for the target:"
+  curl -sS "${H[@]}" "$API/sections?project_id=$TARGET" | python3 -c "import json,sys
+d=json.load(sys.stdin); rs=d.get('results') or d.get('items') or []
+print('   ', len(rs), 'section(s)')"
+  if [ "$TARGET" != "$INBOX" ]; then
+    curl -sS -X POST "${H[@]}" "$API/tasks/$TID/move" -d "{\"project_id\":\"$INBOX\"}" | python3 -c "import json,sys
+d=json.load(sys.stdin); print('  back to inbox | project_id:', d.get('project_id'), '| section_id:', d.get('section_id'))"
+  else
+    echo "  (only one project, already there; the bare-project move was verified above)"
+  fi
+else
+  echo "  (only one project; skipping the move)"
+fi
+
+say "17. close -> GET checked -> reopen -> GET checked"
+code=$(status -X POST "${H[@]}" "$API/tasks/$TID/close")
+echo "  close HTTP $code"
+curl -sS "${H[@]}" "$API/tasks/$TID" | python3 -c "import json,sys
+d=json.load(sys.stdin); print('  checked:', d.get('checked'))"
+code=$(status -X POST "${H[@]}" "$API/tasks/$TID/reopen")
+echo "  reopen HTTP $code"
+
+say "18. GET /tasks/completed (expect 200 + items[]; match on task_id)"
+SINCE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+UNTIL=$(python3 -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+code=$(status "${H[@]}" "$API/tasks/completed?since=$SINCE&until=$UNTIL&limit=5")
+echo "  HTTP $code"
+curl -sS "${H[@]}" "$API/tasks/completed?since=$SINCE&until=$UNTIL&limit=5" | python3 -c "import json,sys
+d=json.load(sys.stdin); it=d.get('items') or []
+print('  items:', len(it), '| has task_id:', bool(it and 'task_id' in it[0]))"
+
+say "19. DELETE /tasks/{id} then GET (expect 204 then 404)"
+code=$(status -X DELETE "${H[@]}" "$API/tasks/$TID")
+echo "  DELETE HTTP $code"
+code=$(status "${H[@]}" "$API/tasks/$TID")
+echo "  GET HTTP $code"
+
+say "20. cleanup runs on exit (DELETE /tasks/{id})"
 echo "  to delete: ${CREATED[*]:-none}"
 
 say "DONE"
