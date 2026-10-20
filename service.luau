@@ -501,6 +501,11 @@ local function removeFromViews(id)
 			end
 		end
 	end
+	-- The view arrays were replaced, so re-point the published active list;
+	-- otherwise the panel keeps rendering the removed task.
+	if any then
+		setActiveView(snapshot.view)
+	end
 	return any
 end
 

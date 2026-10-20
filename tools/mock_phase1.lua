@@ -980,6 +980,7 @@ check("complete makes no extra request", #calls == 1, #calls)
 check("t1 gone from overdue", s12.views.overdue.count == 0 and #s12.views.overdue.tasks == 0, s12.views.overdue.count)
 check("t1 gone from today, t2 kept", s12.views.today.count == 1 and s12.views.today.tasks[1].id == "t2", s12.views.today.count)
 check("t1 gone from p1", s12.views.p1.count == 0, s12.views.p1.count)
+check("active task list re-pointed after complete", #s12.tasks == 1 and s12.tasks[1].id == "t2", #s12.tasks)
 check("counts recomputed", s12.counts.overdue == 0 and s12.counts.today == 1 and s12.counts.p1 == 0, tostring(s12.counts.today))
 
 -- reopen: POST then re-fetch the active view (a filter cannot be recomputed)
@@ -1113,6 +1114,7 @@ check("delete makes no extra request", #calls == 1, #calls)
 check("t1 gone from overdue", s13.views.overdue.count == 0, s13.views.overdue.count)
 check("t1 gone from today, t2 kept", s13.views.today.count == 1 and s13.views.today.tasks[1].id == "t2", s13.views.today.count)
 check("t1 gone from p1", s13.views.p1.count == 0, s13.views.p1.count)
+check("active task list re-pointed after delete", #s13.tasks == 1 and s13.tasks[1].id == "t2", #s13.tasks)
 check("delete recomputes counts", s13.counts.overdue == 0 and s13.counts.today == 1, tostring(s13.counts.today))
 
 -- 404 means the task is already gone: the goal state, not a failure
