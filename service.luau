@@ -641,6 +641,36 @@ local function opTaskReopen(args, done)
 	end)
 end
 
+local function opTaskDelete(args, done)
+	local id = args and args.id
+	if type(id) ~= "string" or id == "" then
+		done({ ok = false, err = { kind = "validation", status = 0, message = "id" } })
+		return
+	end
+	local token = resolveToken()
+	if token == nil then
+		done({ ok = false, err = { kind = "config", status = 0, message = "missing token" } })
+		return
+	end
+	api.deleteTask(token, id, function(r)
+		-- A 404 means the task is already gone: the goal state is reached, so
+		-- do not infer failure from absence. Any other error is real.
+		if not r.ok and not (r.err and r.err.kind == "not_found") then
+			if r.err and api.isTransient(r.err.kind) then
+				done({ ok = false, unknown_outcome = true, err = r.err })
+			else
+				done({ ok = false, err = r.err })
+			end
+			return
+		end
+		removeFromViews(id)
+		refreshCounts()
+		publish()
+		persist()
+		done({ ok = true, data = { id = id, deleted = true } })
+	end)
+end
+
 local function handleOp(op, args, done)
 	if op == "ping" then
 		opPing(done)
@@ -656,6 +686,8 @@ local function handleOp(op, args, done)
 		opTaskComplete(args, done)
 	elseif op == "task.reopen" then
 		opTaskReopen(args, done)
+	elseif op == "task.delete" then
+		opTaskDelete(args, done)
 	else
 		done({ ok = false, err = { kind = "validation", status = 0, message = "unknown op" } })
 	end
