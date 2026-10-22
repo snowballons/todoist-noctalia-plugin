@@ -526,13 +526,18 @@ end
 -- ── require shim (Noctalia-style "./lib/x.luau") ────────────────
 local orig_require = require
 local req_cache = {}
+local req_dir = "" -- directory of the module being loaded (host: caller-relative)
 require = function(path)
 	local rel = path:match("^%./(.+)%.luau$")
 	if rel then
-		if req_cache[rel] == nil then
-			req_cache[rel] = assert(loadfile(PLUGIN_DIR .. rel .. ".luau"))()
+		local key = req_dir ~= "" and (req_dir .. "/" .. rel) or rel
+		if req_cache[key] == nil then
+			local prev = req_dir
+			req_dir = key:match("^(.*)/[^/]+$") or ""
+			req_cache[key] = assert(loadfile(PLUGIN_DIR .. key .. ".luau"))()
+			req_dir = prev
 		end
-		return req_cache[rel]
+		return req_cache[key]
 	end
 	return orig_require(path)
 end
@@ -1051,16 +1056,20 @@ local got = invoke(api.getTask, "tok", "m1")
 check("getTask ok", got and got.ok == true and got.data and got.data.id == "m1", got and got.status)
 check("getTask GETs /tasks/m1", calls[1] ~= nil and calls[1].method == "GET" and calls[1].url:find("/api/v1/tasks/m1", 1, true) ~= nil, calls[1] and calls[1].url)
 
--- close / reopen: 204 with no body
+-- close / reopen: 204 with no response body. Request body must still be
+-- non-empty ("{}") so noctalia.http sets CURLOPT_POSTFIELDS — an empty POST
+-- makes libcurl block on stdin and freezes the shell.
 calls = {}
 local cl = invoke(api.closeTask, "tok", "m1")
 check("closeTask ok, 204, no data", cl and cl.ok == true and cl.status == 204 and cl.data == nil, cl and cl.status)
 check("closeTask POSTs /close", calls[1] ~= nil and calls[1].method == "POST" and calls[1].url:find("/tasks/m1/close", 1, true) ~= nil, calls[1] and calls[1].url)
+check("closeTask sends non-empty POST body", calls[1] ~= nil and calls[1].body ~= nil and calls[1].body ~= "", calls[1] and calls[1].body)
 
 calls = {}
 local ro = invoke(api.reopenTask, "tok", "m1")
 check("reopenTask 204", ro and ro.ok == true and ro.status == 204, ro and ro.status)
 check("reopenTask POSTs /reopen", calls[1] ~= nil and calls[1].url:find("/tasks/m1/reopen", 1, true) ~= nil, calls[1] and calls[1].url)
+check("reopenTask sends non-empty POST body", calls[1] ~= nil and calls[1].body ~= nil and calls[1].body ~= "", calls[1] and calls[1].body)
 
 -- listLabels
 calls = {}

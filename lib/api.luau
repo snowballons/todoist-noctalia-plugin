@@ -102,6 +102,12 @@ end
 -- ── single request ──────────────────────────────────────────────
 -- cb({ ok, status, data, err = { kind, status, message } })
 -- body may be nil (GET / DELETE without payload).
+--
+-- POST with an empty body is special: noctalia.http's curl path sets
+-- CURLOPT_POST but only sets CURLOPT_POSTFIELDS when the body is non-empty.
+-- Without POSTFIELDS, libcurl reads the request body from stdin and blocks
+-- the shell's main thread — the Complete/Reopen freeze. Body-less POSTs
+-- (close/reopen) therefore send "{}"; Todoist accepts it (live-verified).
 function M.request(token, method, path, body, cb)
 	local headers = {
 		M.authHeader(token),
@@ -115,6 +121,9 @@ function M.request(token, method, path, body, cb)
 			return
 		end
 		payload = encoded
+		table.insert(headers, "Content-Type: application/json")
+	elseif method == "POST" then
+		payload = "{}"
 		table.insert(headers, "Content-Type: application/json")
 	end
 
