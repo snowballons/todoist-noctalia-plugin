@@ -1,9 +1,8 @@
 --!nonstrict
 -- panel.luau
 -- Declarative panel: filter tiles, quick capture, task list.
--- Selecting a row expands a Complete/Reopen + Not now pair under it; the row's
--- circle is a status glyph, not a control, so a single click on a task can no
--- longer mutate it by accident.
+-- The circle button expands a Complete/Reopen + Not now pair under the task,
+-- while clicking the task body toggles its description inline (if any).
 local state = require("./lib/state.luau")
 local dates = require("./lib/dates.luau")
 
@@ -27,6 +26,7 @@ local highlightId = nil
 local confirmDeleteId = nil -- task id awaiting a delete confirmation
 local actionId = nil -- task id whose complete/reopen pair is expanded
 local actionHover = nil -- nil | "do" | "dismiss"
+local expandedDescId = nil -- task id whose description is expanded inline
 
 -- Row outline while the action pair is open, then the hovered action's tint.
 local ACTION_OPEN = "outline/0.7"
@@ -115,6 +115,7 @@ local function goView(key)
 	mode = "list"
 	highlightId = nil
 	actionId, actionHover = nil, nil
+	expandedDescId = nil
 	if client.send("tasks.fetch", { view = key }) then
 		render()
 	end
@@ -124,6 +125,7 @@ local function openProject(id)
 	mode = "list"
 	highlightId = nil
 	actionId, actionHover = nil, nil
+	expandedDescId = nil
 	if client.send("tasks.fetch", { view = "project", project_id = id }) then
 		render()
 	end
@@ -260,6 +262,7 @@ local function toggleTask(t)
 	if client.send(op, { id = id }) then
 		actionId = nil
 		actionHover = nil
+		expandedDescId = nil
 		render()
 	end
 end
@@ -275,6 +278,7 @@ local function deleteNow(id)
 		confirmDeleteId = nil
 		actionId = nil
 		actionHover = nil
+		expandedDescId = nil
 		render()
 	end
 end
@@ -291,6 +295,7 @@ local function requestDelete(t)
 	confirmDeleteId = id
 	actionId = nil
 	actionHover = nil
+	expandedDescId = nil
 	render()
 end
 
@@ -350,7 +355,11 @@ end
 -- Select a row to reveal its pair; select it again (or Not now) to collapse.
 local function toggleAction(t)
 	local id = tostring(t.id)
-	actionId = (actionId == id) and nil or id
+	if actionId == id then
+		actionId = nil
+	else
+		actionId = id
+	end
 	actionHover = nil
 	confirmDeleteId = nil
 	render()
@@ -391,15 +400,54 @@ local function actionBar(t)
 	})
 end
 
+local function hasDescription(t)
+	return type(t.description) == "string" and noctalia.string.trim(t.description) ~= ""
+end
+
+local function toggleDescription(t)
+	if not hasDescription(t) then
+		return
+	end
+	local id = tostring(t.id)
+	if expandedDescId == id then
+		expandedDescId = nil
+	else
+		expandedDescId = id
+	end
+	render()
+end
+
+local function descriptionBlock(t)
+	local id = tostring(t.id)
+	return ui.row({
+		key = "desc" .. id,
+		paddingH = 32,
+		paddingV = 2,
+	}, {
+		ui.label({
+			text = t.description or "",
+			color = MUTED,
+			fontSize = 12,
+			maxLines = 10,
+		}),
+	})
+end
+
 local function taskRow(t, border)
 	local rowItems = {}
 
 	local p = tonumber(t.p) or 4
 	rowItems[#rowItems + 1] = ui.glyph({ name = "flag", size = 14, color = PCOLOR[p] or MUTED })
 	local closed = t.checked == true
-	rowItems[#rowItems + 1] = ui.glyph({
-		name = closed and "circle-check" or "circle",
-		size = 16,
+	rowItems[#rowItems + 1] = ui.button({
+		key = "chk" .. tostring(t.id),
+		glyph = closed and "circle-check" or "circle",
+		variant = "ghost",
+		controlSize = "sm",
+		tooltip = noctalia.tr(closed and "ui.panel.reopen" or "ui.panel.complete"),
+		onClick = function()
+			toggleAction(t)
+		end,
 	})
 
 	local due = dates.formatDue(t.due)
@@ -413,6 +461,10 @@ local function taskRow(t, border)
 	end
 	if tonumber(t.p) == 1 then
 		metaParts[#metaParts + 1] = noctalia.tr("priority.p1")
+	end
+	if hasDescription(t) then
+		local exp = expandedDescId == tostring(t.id)
+		metaParts[#metaParts + 1] = exp and (noctalia.tr("ui.panel.edit.description") .. " ▴") or (noctalia.tr("ui.panel.edit.description") .. " ▾")
 	end
 	local sectionItems = {
 		ui.label({ text = t.content, maxLines = 2 }),
@@ -477,13 +529,14 @@ local function taskRow(t, border)
 		border = border,
 		borderWidth = border and 1 or nil,
 		onClick = function()
-			toggleAction(t)
+			toggleDescription(t)
 		end,
 	}, rowItems)
 end
 
 local function taskItem(t)
-	local expanded = actionId == tostring(t.id)
+	local id = tostring(t.id)
+	local expanded = actionId == id
 	local border = nil
 	if expanded then
 		if actionHover == "do" then
@@ -498,7 +551,10 @@ local function taskItem(t)
 	if expanded then
 		children[#children + 1] = actionBar(t)
 	end
-	return ui.column({ key = "ti" .. tostring(t.id), gap = 3 }, children)
+	if expandedDescId == id and hasDescription(t) then
+		children[#children + 1] = descriptionBlock(t)
+	end
+	return ui.column({ key = "ti" .. id, gap = 3 }, children)
 end
 
 local function taskList()
@@ -649,6 +705,7 @@ openEdit = function(t)
 	end
 	editId = tostring(t.id)
 	actionId, actionHover = nil, nil
+	expandedDescId = nil
 	editKey = editKey + 1
 	editErr = nil
 	edit = {
@@ -1211,6 +1268,7 @@ function onClose()
 	client.abandon()
 	highlightId = nil
 	actionId, actionHover = nil, nil
+	expandedDescId = nil
 end
 
 function update()
