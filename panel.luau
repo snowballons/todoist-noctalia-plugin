@@ -1,8 +1,9 @@
 --!nonstrict
--- panel.luau (Phase 1)
--- Declarative panel: filter tiles, quick capture, read-only task list.
--- Read-only by design: the row checkbox is a glyph, not a control, and every
--- row carries Open / Copy link so Todoist stays the place you edit.
+-- panel.luau
+-- Declarative panel: filter tiles, quick capture, task list.
+-- Selecting a row expands a Complete/Reopen + Not now pair under it; the row's
+-- circle is a status glyph, not a control, so a single click on a task can no
+-- longer mutate it by accident.
 local state = require("./lib/state.luau")
 local dates = require("./lib/dates.luau")
 
@@ -24,6 +25,14 @@ local open = false
 local mode = "list" -- "list" | "projects" | "edit"
 local highlightId = nil
 local confirmDeleteId = nil -- task id awaiting a delete confirmation
+local actionId = nil -- task id whose complete/reopen pair is expanded
+local actionHover = nil -- nil | "do" | "dismiss"
+
+-- Row outline while the action pair is open, then the hovered action's tint.
+local ACTION_OPEN = "outline/0.7"
+local ACTION_DO = "#16A34A"
+local ACTION_DISMISS = "#6B7280"
+
 local statusText = nil
 local statusKind = nil -- nil | "ok" | "err" | "warn"
 local quickText = ""
@@ -105,6 +114,7 @@ end
 local function goView(key)
 	mode = "list"
 	highlightId = nil
+	actionId, actionHover = nil, nil
 	if client.send("tasks.fetch", { view = key }) then
 		render()
 	end
@@ -113,6 +123,7 @@ end
 local function openProject(id)
 	mode = "list"
 	highlightId = nil
+	actionId, actionHover = nil, nil
 	if client.send("tasks.fetch", { view = "project", project_id = id }) then
 		render()
 	end
@@ -243,8 +254,12 @@ local function toggleTask(t)
 	end
 	local id = tostring(t.id)
 	local op = (t.checked == true) and "task.reopen" or "task.complete"
-	highlightId = id
+	-- Collapse the pair first: this destroys the pressed button (the same shape
+	-- as the delete confirmation) instead of flipping an `enabled` prop under
+	-- the pointer. The reply then removes the row.
 	if client.send(op, { id = id }) then
+		actionId = nil
+		actionHover = nil
 		render()
 	end
 end
@@ -258,6 +273,8 @@ local function deleteNow(id)
 	highlightId = id
 	if client.send("task.delete", { id = id }) then
 		confirmDeleteId = nil
+		actionId = nil
+		actionHover = nil
 		render()
 	end
 end
@@ -272,6 +289,8 @@ local function requestDelete(t)
 		return
 	end
 	confirmDeleteId = id
+	actionId = nil
+	actionHover = nil
 	render()
 end
 
@@ -306,21 +325,81 @@ end
 
 local openEdit -- defined with the edit form below; the row's pencil calls it
 
-local function taskRow(t)
+local function setActionHover(kind)
+	if actionHover == kind then
+		return
+	end
+	actionHover = kind
+	render()
+end
+
+-- Named, not a closure: a closure gets a fresh generated callback name on every
+-- render, and the reconciler answers a renamed hover prop by closing the hover
+-- session, so the pointer's later leave would never fire and the tint would
+-- stick. A named handler keeps its name across renders, so the session stays
+-- open and the leave edge arrives.
+function onActionHover(state, key)
+	local kind = nil
+	if state == "true" then
+		local prefix = key:sub(1, 2)
+		kind = (prefix == "do" and "do") or (prefix == "no" and "dismiss") or nil
+	end
+	setActionHover(kind)
+end
+
+-- Select a row to reveal its pair; select it again (or Not now) to collapse.
+local function toggleAction(t)
+	local id = tostring(t.id)
+	actionId = (actionId == id) and nil or id
+	actionHover = nil
+	confirmDeleteId = nil
+	render()
+end
+
+local function actionBar(t)
+	local id = tostring(t.id)
+	local closed = t.checked == true
+	return ui.row({
+		key = "aa" .. id,
+		gap = 6,
+		align = "center",
+		paddingH = 6,
+		paddingV = 2,
+	}, {
+		ui.button({
+			key = "do" .. id,
+			text = noctalia.tr(closed and "ui.panel.reopen" or "ui.panel.complete"),
+			variant = "primary",
+			controlSize = "sm",
+			onHover = "onActionHover",
+			onClick = function()
+				toggleTask(t)
+			end,
+		}),
+		ui.button({
+			key = "no" .. id,
+			text = noctalia.tr("ui.panel.action.not_now"),
+			variant = "ghost",
+			controlSize = "sm",
+			onHover = "onActionHover",
+			onClick = function()
+				actionId = nil
+				actionHover = nil
+				render()
+			end,
+		}),
+	})
+end
+
+local function taskRow(t, border)
 	local rowItems = {}
 
 	local p = tonumber(t.p) or 4
 	rowItems[#rowItems + 1] = ui.glyph({ name = "flag", size = 14, color = PCOLOR[p] or MUTED })
 	local closed = t.checked == true
-	rowItems[#rowItems + 1] = ui.button({
-		glyph = closed and "circle-check" or "circle",
-		variant = "ghost",
-		controlSize = "sm",
-		tooltip = noctalia.tr(closed and "ui.panel.reopen" or "ui.panel.complete"),
-		enabled = not client.busy(),
-		onClick = function()
-			toggleTask(t)
-		end,
+	rowItems[#rowItems + 1] = ui.glyph({
+		name = closed and "circle-check" or "circle",
+		size = 16,
 	})
 
 	local due = dates.formatDue(t.due)
@@ -393,8 +472,33 @@ local function taskRow(t)
 		align = "center",
 		key = "t" .. tostring(t.id),
 		paddingV = 4,
-		fill = true,
+		paddingH = 6,
+		radius = 6,
+		border = border,
+		borderWidth = border and 1 or nil,
+		onClick = function()
+			toggleAction(t)
+		end,
 	}, rowItems)
+end
+
+local function taskItem(t)
+	local expanded = actionId == tostring(t.id)
+	local border = nil
+	if expanded then
+		if actionHover == "do" then
+			border = ACTION_DO
+		elseif actionHover == "dismiss" then
+			border = ACTION_DISMISS
+		else
+			border = ACTION_OPEN
+		end
+	end
+	local children = { taskRow(t, border) }
+	if expanded then
+		children[#children + 1] = actionBar(t)
+	end
+	return ui.column({ key = "ti" .. tostring(t.id), gap = 3 }, children)
 end
 
 local function taskList()
@@ -410,7 +514,7 @@ local function taskList()
 		if confirmDeleteId ~= nil and tostring(t.id) == confirmDeleteId then
 			rows[#rows + 1] = confirmRow(t)
 		else
-			rows[#rows + 1] = taskRow(t)
+			rows[#rows + 1] = taskItem(t)
 		end
 	end
 	return ui.scroll({
@@ -544,6 +648,7 @@ openEdit = function(t)
 		return
 	end
 	editId = tostring(t.id)
+	actionId, actionHover = nil, nil
 	editKey = editKey + 1
 	editErr = nil
 	edit = {
@@ -1105,6 +1210,7 @@ function onClose()
 	open = false
 	client.abandon()
 	highlightId = nil
+	actionId, actionHover = nil, nil
 end
 
 function update()

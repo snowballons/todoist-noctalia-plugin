@@ -49,6 +49,7 @@
   "ui.panel.link_copied": "Link copied.",
   "ui.panel.complete": "Complete",
   "ui.panel.reopen": "Reopen",
+  "ui.panel.action.not_now": "Not now",
   "ui.panel.delete": "Delete",
   "ui.panel.delete.confirm": "Delete \"{content}\"?",
   "ui.panel.delete.yes": "Delete",

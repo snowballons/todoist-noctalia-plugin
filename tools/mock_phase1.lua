@@ -1221,31 +1221,141 @@ local function findButton(pred)
 	return found
 end
 
-local toggle = findButton(function(props)
-	return props.glyph == "circle"
-end)
-check("open task shows a circle (unchecked) button", toggle ~= nil)
+local function findNode(kind, pred)
+	local found = nil
+	local function rec(n)
+		if type(n) ~= "table" then
+			return
+		end
+		if n.kind == kind and pred(n.props) then
+			found = n
+		end
+		for _, c in ipairs(n.children or {}) do
+			rec(c)
+		end
+	end
+	rec(rendered)
+	return found
+end
+
+local function rowOf(id)
+	return findNode("row", function(props)
+		return props.key == "t" .. id
+	end)
+end
+
+local function scrollTree()
+	local function rec(n)
+		if type(n) ~= "table" then
+			return nil
+		end
+		if n.kind == "scroll" then
+			return n
+		end
+		for _, c in ipairs(n.children or {}) do
+			local hit = rec(c)
+			if hit ~= nil then
+				return hit
+			end
+		end
+		return nil
+	end
+	return rec(rendered)
+end
+
+-- Selecting a row no longer completes it: it reveals the pair below.
+local row3 = rowOf("t3")
+check("task row exposes a selection callback", row3 ~= nil and type(row3.props.onClick) == "function")
 state_store["cmd.panel"] = nil
-if toggle then
-	toggle.props.onClick()
+if row3 then
+	row3.props.onClick()
+end
+check("selecting a task does not mutate it", getState("cmd.panel") == nil)
+local doBtn = findButton(function(props)
+	return props.text == "ui.panel.complete"
+end)
+check("selecting a task reveals Complete", doBtn ~= nil)
+check("hover uses a named handler so the leave edge survives a render", doBtn ~= nil and doBtn.props.onHover == "onActionHover", doBtn and type(doBtn.props.onHover))
+check("selecting a task reveals Not now", findButton(function(props)
+	return props.text == "ui.panel.action.not_now"
+end) ~= nil)
+check("the open pair outlines the row", (rowOf("t3") or { props = {} }).props.border == "outline/0.7", (rowOf("t3") or { props = {} }).props.border)
+
+if doBtn then
+	onActionHover("true", doBtn.props.key)
+end
+check("hovering Complete tints the row green", (rowOf("t3") or { props = {} }).props.border == "#16A34A", (rowOf("t3") or { props = {} }).props.border)
+check("hover keeps the pair open", findButton(function(props)
+	return props.text == "ui.panel.complete"
+end) ~= nil)
+if doBtn then
+	onActionHover("false", doBtn.props.key)
+end
+check("leaving Complete restores the outline", (rowOf("t3") or { props = {} }).props.border == "outline/0.7", (rowOf("t3") or { props = {} }).props.border)
+
+local notNow = findButton(function(props)
+	return props.text == "ui.panel.action.not_now"
+end)
+if notNow then
+	onActionHover("true", notNow.props.key)
+end
+check("hovering Not now tints the row gray", (rowOf("t3") or { props = {} }).props.border == "#6B7280", (rowOf("t3") or { props = {} }).props.border)
+if notNow then
+	onActionHover("false", notNow.props.key)
+	notNow.props.onClick()
+end
+check("Not now collapses without mutating", getState("cmd.panel") == nil and findButton(function(props)
+	return props.text == "ui.panel.complete"
+end) == nil)
+check("Not now keeps the row", rowOf("t3") ~= nil)
+
+row3 = rowOf("t3")
+if row3 then
+	row3.props.onClick()
+end
+doBtn = findButton(function(props)
+	return props.text == "ui.panel.complete"
+end)
+state_store["cmd.panel"] = nil
+if doBtn then
+	doBtn.props.onClick()
 end
 local cmd = getState("cmd.panel")
-check("clicking an open task sends task.complete", cmd ~= nil and cmd.op == "task.complete" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
+check("Complete sends task.complete", cmd ~= nil and cmd.op == "task.complete" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
+check("Complete collapses the pair", findButton(function(props)
+	return props.text == "ui.panel.complete"
+end) == nil)
+check("Complete click sends no revealKey for a row that is about to vanish", (function()
+	local sc = scrollTree()
+	return sc ~= nil and sc.props.revealKey == nil
+end)())
+check("the status circle is a glyph, not a button", findNode("glyph", function(props)
+	return props.name == "circle"
+end) ~= nil and findButton(function(props)
+	return props.glyph == "circle" or props.glyph == "circle-check"
+end) == nil)
 
 state_store["todoist"].tasks[1].checked = true
 state_store["todoist"].views.inbox.tasks[1].checked = true
 onOpen({})
 settlePanel()
-local toggle2 = findButton(function(props)
-	return props.glyph == "circle-check"
+check("a closed task shows a circle-check glyph", findNode("glyph", function(props)
+	return props.name == "circle-check"
+end) ~= nil)
+local row3b = rowOf("t3")
+if row3b then
+	row3b.props.onClick()
+end
+local reopenBtn = findButton(function(props)
+	return props.text == "ui.panel.reopen"
 end)
-check("closed task shows a circle-check (checked) button", toggle2 ~= nil)
+check("selecting a closed task reveals Reopen", reopenBtn ~= nil)
 state_store["cmd.panel"] = nil
-if toggle2 then
-	toggle2.props.onClick()
+if reopenBtn then
+	reopenBtn.props.onClick()
 end
 cmd = getState("cmd.panel")
-check("clicking a closed task sends task.reopen", cmd ~= nil and cmd.op == "task.reopen" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
+check("Reopen sends task.reopen", cmd ~= nil and cmd.op == "task.reopen" and cmd.args and cmd.args.id == "t3", cmd and cmd.op)
 
 -- ── T13: M3 task.delete + confirm_delete ────────────────────────
 print("\n== T13 delete ==")
