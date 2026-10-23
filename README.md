@@ -150,13 +150,33 @@ panel / launcher / widget                     state.watch → repaint
 | 4 | Caching & sync | partially (read-through cache, refresh on open/mutation) |
 | 5 | Release hardening | in progress (token/cache hardening, mock, smoke, lint) |
 
-Known limits: completing a task removes it from the list and there is no
-completed view yet, so **reopening from the panel is not reachable** — use
-Todoist. Quick Add returns no task id, so the panel refetches its view instead
-of inserting the task locally. There is no background sync, so data is as fresh
-as the last open/refresh. Labels are editable but not shown on rows, and
-sections are assignable but projects are not grouped by them. The UI is English
-only.
+Known limits: Quick Add returns no task id, so the panel refetches its view
+instead of inserting the task locally. There is no background sync, so data is
+as fresh as the last open/refresh. Labels are editable but not shown on rows,
+and sections are assignable but projects are not grouped by them. The UI is
+English only.
+
+## Roadmap
+
+Features not yet implemented, in rough priority order:
+
+Phase 3/4 — richer panel and sync:
+
+- **Labels on task rows** — labels are stored and editable in the form but not
+  displayed on the row itself.
+- **Widget count** — the bar button is a plain glyph; it should show the
+  overdue or due-today count as a badge.
+- **Background sync / polling** — data is only as fresh as the last open or
+  manual refresh; a background timer would keep counts current without opening
+  the panel.
+- **Section grouping in project view** — tasks inside a project are listed flat;
+  they should be grouped under their section headers.
+- **In-panel search** — no way to filter the visible task list by keyword.
+
+Phase 5 — polish:
+
+- **Non-English locales** — all strings are in `translations/en.json`; the
+  plugin ships no other locale.
 
 ## License
 
