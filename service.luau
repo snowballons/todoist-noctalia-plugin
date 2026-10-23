@@ -14,6 +14,7 @@ local dates = require("./lib/dates.luau")
 local SCHEMA = 1
 local WATCHDOG_MS = 30000 -- documented http() has no timeout
 local RETRY_DELAY_MS = 2000
+local RATE_LIMIT_DELAY_MS = 10000 -- 429: no Retry-After header accessible, use fixed backoff
 local VIEW_TTL_MS = 60 * 1000
 local PROJECTS_TTL_MS = 5 * 60 * 1000
 
@@ -242,7 +243,10 @@ local function retryTransient(fn, cb, attempt)
 		if r.ok or not api.isTransient(kind) or attempt >= maxRetries() then
 			cb(r)
 		else
-			delay(RETRY_DELAY_MS, function()
+			-- 429s use a longer fixed backoff: noctalia.http exposes no response
+			-- headers so the Retry-After value is not readable.
+			local ms = (kind == "rate_limit") and RATE_LIMIT_DELAY_MS or RETRY_DELAY_MS
+			delay(ms, function()
 				retryTransient(fn, cb, attempt + 1)
 			end)
 		end

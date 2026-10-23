@@ -70,6 +70,7 @@ end
 -- Transient kinds are the only ones safe to retry, and only for reads.
 function M.isTransient(kind)
 	return kind == "network" or kind == "server" or kind == "timeout"
+		or kind == "rate_limit"
 end
 
 -- Build the Authorization header value. Split out for unit tests.
