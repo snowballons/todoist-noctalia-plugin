@@ -844,7 +844,10 @@ local function saveEdit()
 	local c, moved = editDiff()
 	if next(c) == nil then
 		if moved then
-			return -- the Move button owns project/section
+			-- Only the project/section changed: Save cannot do that, Move can.
+			editErr = noctalia.tr("ui.panel.edit.save_use_move")
+			render()
+			return
 		end
 		closeEdit()
 		return
@@ -861,6 +864,8 @@ local function moveEdit()
 	end
 	local _, moved = editDiff()
 	if not moved then
+		editErr = noctalia.tr("ui.panel.edit.move_no_change")
+		render()
 		return
 	end
 	editErr = nil

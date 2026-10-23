@@ -74,6 +74,8 @@
   "ui.panel.edit.move": "Move",
   "ui.panel.edit.cancel": "Cancel",
   "ui.panel.edit.content_required": "A task needs a title.",
+  "ui.panel.edit.move_no_change": "Change the project or section first.",
+  "ui.panel.edit.save_use_move": "Use Move to change the project or section.",
   "ui.panel.delete.no": "Cancel",
   "ui.panel.updated": "Updated {time}",
   "ui.panel.subtask": "Sub-task",
