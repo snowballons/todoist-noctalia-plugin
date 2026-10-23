@@ -6,7 +6,7 @@ author = "snowballons"
 license = "MIT"
 icon = "checklist"
 description = "Todoist tasks in Noctalia"
-tags = ["productivity", "panel", "launcher"]
+tags = ["productivity", "panel", "launcher", "bar"]
 dependencies = ["chmod", "xdg-open"]
 
 [[setting]]
