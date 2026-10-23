@@ -559,20 +559,70 @@ end
 
 local function taskList()
 	local tasks = snap.tasks or {}
-	if #tasks == 0 then
-		if snap.loading then
-			return ui.label({ text = noctalia.tr("ui.panel.loading"), color = MUTED })
-		end
-		return ui.label({ text = noctalia.tr("ui.panel.tasks.empty"), color = MUTED })
-	end
 	local rows = {}
-	for _, t in ipairs(tasks) do
-		if confirmDeleteId ~= nil and tostring(t.id) == confirmDeleteId then
-			rows[#rows + 1] = confirmRow(t)
-		else
-			rows[#rows + 1] = taskItem(t)
+
+	if #tasks == 0 then
+		rows[#rows + 1] = ui.label({
+			text = snap.loading and noctalia.tr("ui.panel.loading") or noctalia.tr("ui.panel.tasks.empty"),
+			color = MUTED,
+		})
+	else
+		for _, t in ipairs(tasks) do
+			if confirmDeleteId ~= nil and tostring(t.id) == confirmDeleteId then
+				rows[#rows + 1] = confirmRow(t)
+			else
+				rows[#rows + 1] = taskItem(t)
+			end
 		end
 	end
+
+	-- Quick-add lives below the tasks inside the scroll so it floats down
+	-- naturally as tasks are added and only scrolls away when the list is long.
+	rows[#rows + 1] = ui.separator({ key = "qa-sep" })
+	rows[#rows + 1] = ui.row({ key = "qa-row", gap = 6, align = "center" }, {
+		ui.input({
+			key = "quick" .. tostring(quickKey),
+			value = "",
+			placeholder = noctalia.tr("ui.panel.quick.placeholder"),
+			flexGrow = 1,
+			controlSize = "md",
+			enabled = not client.busy(),
+			onChange = function(text)
+				quickText = text or ""
+			end,
+			onSubmit = function()
+				submitQuick()
+			end,
+		}),
+		ui.button({
+			glyph = "plus",
+			text = noctalia.tr("ui.panel.quick.add"),
+			variant = "primary",
+			controlSize = "md",
+			enabled = (not client.busy()) and noctalia.string.trim(quickText) ~= "",
+			onClick = function()
+				submitQuick()
+			end,
+		}),
+	})
+	rows[#rows + 1] = ui.label({
+		key = "qa-hint",
+		text = noctalia.tr("ui.panel.quick.hint"),
+		fontSize = 11,
+		color = MUTED,
+		maxLines = 2,
+	})
+	local summary = defaultsSummary()
+	if summary then
+		rows[#rows + 1] = ui.label({
+			key = "qa-defaults",
+			text = noctalia.tr("ui.panel.quick.defaults", { summary = summary }),
+			fontSize = 11,
+			color = MUTED,
+			maxLines = 1,
+		})
+	end
+
 	return ui.scroll({
 		flexGrow = 1,
 		fill = true,
@@ -824,13 +874,9 @@ local function editForm()
 		return ui.label({ text = "" })
 	end
 
+	-- NOTE: the "Edit task" heading is rendered outside this scroll in render(),
+	-- so it stays pinned at the top while the user scrolls through the fields.
 	local items = {}
-	items[#items + 1] = ui.label({
-		text = noctalia.tr("ui.panel.edit.heading"),
-		fontSize = 14,
-		fontWeight = "bold",
-		maxLines = 1,
-	})
 
 	items[#items + 1] = ui.input({
 		key = "ec" .. tostring(editKey),
@@ -1030,8 +1076,7 @@ local function body()
 end
 
 local function footer()
-	local items = { ui.separator({}) }
-
+	-- Resolve the status/error banner (shared by all modes).
 	local banner = nil
 	if snap.error then
 		banner = ui.label({
@@ -1046,60 +1091,22 @@ local function footer()
 			maxLines = 2,
 		})
 	end
+
+	-- In edit mode there is no quick-add and no separator: the edit scroll
+	-- needs every pixel. Only the banner (if any) is shown.
+	if mode == "edit" then
+		if banner then
+			return banner
+		end
+		return nil
+	end
+
+	-- List / projects mode: separator + optional banner. Quick-add now lives
+	-- inside the taskList() scroll so it is not duplicated here.
+	local items = { ui.separator({}) }
 	if banner then
 		items[#items + 1] = banner
 	end
-
-	-- While editing, the footer is just the banner: quick-add would post a new
-	-- task while the user is working on an existing one.
-	if mode == "edit" then
-		return ui.column({ gap = 8 }, items)
-	end
-
-	items[#items + 1] = ui.row({ gap = 6, align = "center" }, {
-		ui.input({
-			key = "quick" .. tostring(quickKey),
-			value = "",
-			placeholder = noctalia.tr("ui.panel.quick.placeholder"),
-			flexGrow = 1,
-			controlSize = "md",
-			enabled = not client.busy(),
-			onChange = function(text)
-				quickText = text or ""
-			end,
-			onSubmit = function()
-				submitQuick()
-			end,
-		}),
-		ui.button({
-			glyph = "plus",
-			text = noctalia.tr("ui.panel.quick.add"),
-			variant = "primary",
-			controlSize = "md",
-			enabled = (not client.busy()) and noctalia.string.trim(quickText) ~= "",
-			onClick = function()
-				submitQuick()
-			end,
-		}),
-	})
-
-	items[#items + 1] = ui.label({
-		text = noctalia.tr("ui.panel.quick.hint"),
-		fontSize = 11,
-		color = MUTED,
-		maxLines = 2,
-	})
-
-	local summary = defaultsSummary()
-	if summary then
-		items[#items + 1] = ui.label({
-			text = noctalia.tr("ui.panel.quick.defaults", { summary = summary }),
-			fontSize = 11,
-			color = MUTED,
-			maxLines = 1,
-		})
-	end
-
 	return ui.column({ gap = 8 }, items)
 end
 
@@ -1132,10 +1139,22 @@ render = function()
 	if mode ~= "edit" then
 		items[#items + 1] = tiles()
 		items[#items + 1] = nav()
+	else
+		-- Pin the heading above the scroll so it stays visible while the user
+		-- scrolls through all the edit fields.
+		items[#items + 1] = ui.label({
+			text = noctalia.tr("ui.panel.edit.heading"),
+			fontSize = 14,
+			fontWeight = "bold",
+			maxLines = 1,
+		})
 	end
 	items[#items + 1] = body()
-	items[#items + 1] = footer()
-	panel.render(ui.column({ gap = 10, padding = 12 }, items))
+	local f = footer()
+	if f ~= nil then
+		items[#items + 1] = f
+	end
+	panel.render(ui.column({ gap = 10, padding = 12, flexGrow = 1 }, items))
 end
 
 -- ── protocol ────────────────────────────────────────────────────
