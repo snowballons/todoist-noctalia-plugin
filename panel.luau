@@ -38,6 +38,13 @@ local statusKind = nil -- nil | "ok" | "err" | "warn"
 local quickText = ""
 local quickKey = 0
 
+-- Undo state for task.complete. Captured before the row is removed so the
+-- user has UNDO_TTL_MS to reverse the action via task.reopen.
+-- Delete has no server-side restore, so undo is not offered for it.
+local UNDO_TTL_MS = 5000
+local undoTask = nil   -- full task object saved at complete time
+local undoExpiry = nil -- noctalia.nowMs() + UNDO_TTL_MS
+
 -- Edit form. Every keystroke lands in `edit`, so re-seeding an input (which
 -- needs a new key) never loses in-progress text.
 local editId = nil
@@ -247,6 +254,25 @@ local function nav()
 	return ui.row({ gap = 6, align = "center" }, items)
 end
 
+-- ── undo ────────────────────────────────────────────────────────
+local function clearUndo()
+	undoTask = nil
+	undoExpiry = nil
+	render()
+end
+
+local function undoComplete()
+	if undoTask == nil or client.busy() then
+		return
+	end
+	local t = undoTask
+	undoTask = nil
+	undoExpiry = nil
+	if client.send("task.reopen", { id = tostring(t.id) }) then
+		render()
+	end
+end
+
 -- Complete a task, or reopen it when it is already closed. Both are
 -- idempotent server-side; an unknown outcome is resolved by refreshing rather
 -- than by guessing.
@@ -256,6 +282,16 @@ local function toggleTask(t)
 	end
 	local id = tostring(t.id)
 	local op = (t.checked == true) and "task.reopen" or "task.complete"
+	-- Capture the task for undo before the row disappears (complete only;
+	-- delete has no server-side restore so undo is not offered for it).
+	if op == "task.complete" then
+		undoTask = t
+		undoExpiry = noctalia.nowMs() + UNDO_TTL_MS
+	else
+		-- Reopening cancels any pending undo for this task.
+		undoTask = nil
+		undoExpiry = nil
+	end
 	-- Collapse the pair first: this destroys the pressed button (the same shape
 	-- as the delete confirmation) instead of flipping an `enabled` prop under
 	-- the pointer. The reply then removes the row.
@@ -557,9 +593,50 @@ local function taskItem(t)
 	return ui.column({ key = "ti" .. id, gap = 3 }, children)
 end
 
+local function undoRow()
+	if undoTask == nil then
+		return nil
+	end
+	return ui.row({
+		key = "undo-row",
+		gap = 6,
+		align = "center",
+		paddingV = 6,
+		paddingH = 8,
+		radius = 6,
+		fill = "surface_variant/0.35",
+	}, {
+		ui.label({
+			text = noctalia.tr("ui.panel.undo.completed", { content = undoTask.content }),
+			flexGrow = 1,
+			maxLines = 1,
+			fontSize = 12,
+		}),
+		ui.button({
+			text = noctalia.tr("ui.panel.undo.action"),
+			variant = "secondary",
+			controlSize = "sm",
+			enabled = not client.busy(),
+			onClick = undoComplete,
+		}),
+		ui.button({
+			glyph = "x",
+			variant = "ghost",
+			controlSize = "sm",
+			onClick = clearUndo,
+		}),
+	})
+end
+
 local function taskList()
 	local tasks = snap.tasks or {}
 	local rows = {}
+
+	-- Undo toast: shown after a complete, auto-expires after UNDO_TTL_MS.
+	local ur = undoRow()
+	if ur ~= nil then
+		rows[#rows + 1] = ur
+	end
 
 	if #tasks == 0 then
 		rows[#rows + 1] = ui.label({
@@ -1214,9 +1291,15 @@ noctalia.state.watch("evt.panel", function(msg)
 			-- The mutation may or may not have landed: re-read rather than
 			-- retry, so we never close or reopen a task twice.
 			setStatus("warn", noctalia.tr("err.unknown_outcome_refresh"))
+			-- Undo is no longer safe: we don't know whether the action landed.
+			undoTask = nil
+			undoExpiry = nil
 			client.send("tasks.refresh", {})
 		else
 			setStatus("err", errText(msg.err))
+			-- Complete failed: the task was never removed, so undo is moot.
+			undoTask = nil
+			undoExpiry = nil
 		end
 		render()
 	elseif op == "task.update" or op == "task.move" then
@@ -1293,6 +1376,8 @@ function onClose()
 	highlightId = nil
 	actionId, actionHover = nil, nil
 	expandedDescId = nil
+	undoTask = nil
+	undoExpiry = nil
 end
 
 function update()
@@ -1302,5 +1387,9 @@ function update()
 	if client.watchdog() then
 		setStatus("warn", noctalia.tr("err.timeout"))
 		render()
+	end
+	-- Auto-expire the undo toast when the window has passed.
+	if undoExpiry ~= nil and noctalia.nowMs() > undoExpiry then
+		clearUndo()
 	end
 end

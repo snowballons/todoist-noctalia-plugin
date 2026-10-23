@@ -84,6 +84,8 @@
   "ui.panel.quick.hint": "Todoist parses dates, projects, labels and priorities.",
   "ui.panel.quick.defaults": "Defaults: {summary}",
   "ui.panel.quick.sent": "Sent. Refreshing...",
+  "ui.panel.undo.completed": "Completed: {content}",
+  "ui.panel.undo.action": "Undo",
   "ui.panel.more": "and {count} more",
   "err.config": "No Todoist API token set.",
   "err.auth": "The API token was rejected.",
