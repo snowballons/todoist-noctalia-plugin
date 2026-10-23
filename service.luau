@@ -329,6 +329,66 @@ local function fetchView(token, key, spec, cb)
 	end
 end
 
+-- Completed tasks from the last 7 days. The completed endpoint returns a
+-- different shape: items have task_id (the real task id) instead of id, and
+-- there is no is_deleted flag. Builds normTask-compatible objects with
+-- checked = true so the panel can render them and offer reopen.
+local COMPLETED_WINDOW_DAYS = 7
+local function fetchCompleted(token, cb)
+	local now = noctalia.nowMs()
+	local sinceMs = now - COMPLETED_WINDOW_DAYS * 24 * 60 * 60 * 1000
+	-- ISO 8601 UTC: noctalia.nowMs returns Unix ms.
+	local function msToIso(ms)
+		-- Lua's os.date with "!%Y-%m-%dT%H:%M:%SZ" formats UTC.
+		return os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(ms / 1000))
+	end
+	local sinceTs = msToIso(sinceMs)
+	retryTransient(function(c)
+		api.completedTasks(token, sinceTs, nil, c)
+	end, function(r)
+		if not r.ok then
+			cb(false, r.err)
+			return
+		end
+		local items = {}
+		for _, item in ipairs(r.items or {}) do
+			-- The completed endpoint item shape differs from the task shape:
+			-- use task_id as the task id; synthesise a minimal normTask object.
+			local id = item.task_id or item.id
+			if id ~= nil then
+				items[#items + 1] = {
+					id = id,
+					content = item.content or "",
+					description = item.note or "",
+					project_id = item.project_id,
+					section_id = nil,
+					parent_id = nil,
+					labels = {},
+					priority = nil,
+					p = 4,
+					due = nil,
+					deadline = nil,
+					checked = true,
+					added_at = nil,
+					child_order = 0,
+					url = "https://app.todoist.com/app/task/" .. tostring(id),
+					completed_at = item.completed_at,
+				}
+			end
+		end
+		-- Most-recently completed first.
+		table.sort(items, function(a, b)
+			return (a.completed_at or "") > (b.completed_at or "")
+		end)
+		snapshot.views["completed"] = {
+			tasks = items,
+			count = #items,
+			fetched_at = noctalia.nowMs(),
+		}
+		cb(true)
+	end)
+end
+
 -- Sequential runner: stops at the first failure.
 local function chain(steps, done)
 	local i = 0
@@ -450,6 +510,9 @@ local function fetchOne(view, projectId, force, done)
 		end
 		key = "project:" .. projectId
 		spec = { kind = "project", project_id = projectId }
+	elseif view == "completed" then
+		key = "completed"
+		spec = { kind = "completed" }
 	else
 		key = view
 		if FILTER_VIEWS[view] then
@@ -460,6 +523,30 @@ local function fetchOne(view, projectId, force, done)
 			done({ ok = false, err = { kind = "validation", status = 0, message = "unknown view" } })
 			return
 		end
+	end
+
+	local existing = snapshot.views[key]
+	if not force and type(existing) == "table" and existing.fetched_at
+		and (noctalia.nowMs() - existing.fetched_at) < VIEW_TTL_MS then
+		setActiveView(key)
+		publish()
+		done({ ok = true })
+		return
+	end
+
+	-- Completed view uses its own fetcher (different API shape).
+	if view == "completed" then
+		snapshot.loading = true
+		snapshot.error = nil
+		publish()
+		fetchCompleted(token, function(ok, err)
+			snapshot.loading = false
+			snapshot.error = err
+			setActiveView("completed")
+			publish()
+			done({ ok = ok, err = err })
+		end)
+		return
 	end
 
 	local existing = snapshot.views[key]

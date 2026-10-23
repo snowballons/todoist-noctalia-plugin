@@ -238,6 +238,7 @@ local function nav()
 		tab("today", "ui.panel.nav.today", mode == "list" and v == "today"),
 		tab("inbox", "ui.panel.nav.inbox", mode == "list" and v == "inbox"),
 		tab("__projects", "ui.panel.nav.projects", mode == "projects" or activeProjectId ~= nil),
+		tab("completed", "ui.panel.nav.completed", mode == "list" and v == "completed"),
 	}
 	if activeProjectId then
 		local name = projectName(activeProjectId)
@@ -707,6 +708,72 @@ local function taskList()
 	}, rows)
 end
 
+local function completedList()
+	local tasks = snap.tasks or {}
+	if #tasks == 0 then
+		if snap.loading then
+			return ui.label({ text = noctalia.tr("ui.panel.loading"), color = MUTED })
+		end
+		return ui.label({ text = noctalia.tr("ui.panel.tasks.completed_empty"), color = MUTED })
+	end
+	local rows = {}
+	for _, t in ipairs(tasks) do
+		-- Completed rows: circle (reopen), title + meta, open-in-Todoist only.
+		-- No edit, no delete, no action expand — the task is already done.
+		local p = tonumber(t.p) or 4
+		local metaParts = {}
+		local pname = projectName(t.project_id)
+		if pname then metaParts[#metaParts + 1] = pname end
+		if t.completed_at then
+			-- Show date only, not full ISO timestamp.
+			local d = tostring(t.completed_at):sub(1, 10)
+			metaParts[#metaParts + 1] = d
+		end
+		local sectionItems = { ui.label({ text = t.content, maxLines = 2 }) }
+		if #metaParts > 0 then
+			sectionItems[#sectionItems + 1] = ui.label({
+				text = table.concat(metaParts, "  ·  "),
+				fontSize = 11,
+				color = MUTED,
+				maxLines = 1,
+			})
+		end
+		rows[#rows + 1] = ui.row({
+			gap = 6,
+			align = "center",
+			key = "ct" .. tostring(t.id),
+			paddingV = 4,
+			paddingH = 6,
+			radius = 6,
+		}, {
+			ui.glyph({ name = "flag", size = 14, color = PCOLOR[p] or MUTED }),
+			ui.button({
+				key = "cchk" .. tostring(t.id),
+				glyph = "circle-check",
+				variant = "ghost",
+				controlSize = "sm",
+				tooltip = noctalia.tr("ui.panel.reopen"),
+				enabled = not client.busy(),
+				onClick = function()
+					if client.busy() then return end
+					if client.send("task.reopen", { id = tostring(t.id) }) then
+						render()
+					end
+				end,
+			}),
+			ui.column({ gap = 1, flexGrow = 1 }, sectionItems),
+			ui.button({
+				glyph = "external-link",
+				variant = "ghost",
+				controlSize = "sm",
+				tooltip = noctalia.tr("ui.panel.open_in_todoist"),
+				onClick = function() openUrl(t.url) end,
+			}),
+		})
+	end
+	return ui.scroll({ flexGrow = 1, fill = true }, rows)
+end
+
 local function projectList()
 	local projects = snap.projects or {}
 	if #projects == 0 then
@@ -1153,6 +1220,9 @@ local function body()
 	end
 	if mode == "projects" then
 		return projectList()
+	end
+	if mode == "list" and view() == "completed" then
+		return completedList()
 	end
 	return taskList()
 end
