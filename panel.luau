@@ -549,7 +549,7 @@ local function taskRow(t, border)
 		glyph = "trash",
 		variant = "ghost",
 		controlSize = "sm",
-		tooltip = noctalia.tr("ui.panel.delete"),
+		tooltip = noctalia.tr("ui.panel.delete.tooltip"),
 		enabled = not client.busy(),
 		onClick = function()
 			requestDelete(t)
