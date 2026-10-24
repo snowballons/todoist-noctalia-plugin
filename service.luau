@@ -1293,7 +1293,7 @@ function update()
 	end
 end
 
--- Test hook: noctalia msg plugin snowballons/todoist:core all ping|refresh
+-- Test hook: noctalia msg plugin snowballons/todoist-manager:core all ping|refresh
 function onIpc(event)
 	if event == "ping" then
 		enqueueInternal("ping", {})

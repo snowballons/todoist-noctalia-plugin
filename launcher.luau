@@ -155,7 +155,7 @@ function onActivate(id)
 	local t = byId[id]
 	if t then
 		noctalia.state.set("open_task", { id = t.id, project_id = t.project_id })
-		noctalia.togglePanel("snowballons/todoist:manager")
+		noctalia.togglePanel("snowballons/todoist-manager:manager")
 	end
 end
 

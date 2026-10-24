@@ -6,5 +6,5 @@ barWidget.setGlyph("checklist")
 barWidget.setTooltip(noctalia.tr("widget.tooltip"))
 
 function onClick()
-	noctalia.togglePanel("snowballons/todoist:manager")
+	noctalia.togglePanel("snowballons/todoist-manager:manager")
 end

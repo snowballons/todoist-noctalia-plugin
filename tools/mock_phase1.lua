@@ -2,7 +2,7 @@
 tools/mock_phase1.lua — offline harness for the Todoist Phase 1 plugin.
 
 Runs with stock Lua 5.4, no Noctalia instance needed:
-    lua5.4 tools/mock_phase1.lua        (from the todoist/ directory)
+    lua5.4 tools/mock_phase1.lua        (from the todoist-manager/ directory)
 
 What it does: stubs the `noctalia` surface (http, json, state, string, ...),
 loads the REAL service.luau / panel.luau / launcher.luau through a require
@@ -945,7 +945,7 @@ toggled = {}
 onActivate(results[2].id)
 check("open_task state set", getState("open_task") ~= nil and getState("open_task").id == "t1", getState("open_task") and getState("open_task").id)
 check("open_task carries project", getState("open_task") ~= nil and getState("open_task").project_id == "p-home", getState("open_task") and getState("open_task").project_id)
-check("panel toggled", #toggled == 1 and toggled[1] == "snowballons/todoist:manager", toggled[1])
+check("panel toggled", #toggled == 1 and toggled[1] == "snowballons/todoist-manager:manager", toggled[1])
 
 onQuery("buy milk")
 onActivate("create")
@@ -970,7 +970,7 @@ assert(loadfile(PLUGIN_DIR .. "widget.luau"))()
 check("widget sets a glyph", glyphSet == "checklist", glyphSet)
 check("widget sets a tooltip", tooltipSet == "widget.tooltip", tooltipSet)
 onClick()
-check("widget click toggles panel", #toggled == 1 and toggled[1] == "snowballons/todoist:manager", toggled[1])
+check("widget click toggles panel", #toggled == 1 and toggled[1] == "snowballons/todoist-manager:manager", toggled[1])
 
 -- ── T11: M1 api mutations ───────────────────────────────────────
 print("\n== T11 M1 api mutations ==")
