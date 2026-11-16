@@ -4,6 +4,25 @@ Manage your Todoist tasks from the Noctalia panel and capture new ones from the
 launcher — without leaving the shell. Read, complete, edit, move, delete, and
 quick-add tasks.
 
+## Screenshots
+
+Inbox view with filter tiles, priority flags, due dates and per-task actions:
+
+![Todoist panel showing the Inbox tab with priority flags, due dates and quick actions](screenshots/panel-inbox.webp)
+
+Edit form for a task: title, description, priority, due date, project, section and
+labels:
+
+![Todoist panel edit form with title, description, priority, due date, project, section and labels](screenshots/panel-edit-task.webp)
+
+Completed view:
+
+![Todoist panel Completed tab listing tasks completed in the last 7 days](screenshots/panel-completed.webp)
+
+Quick capture from the launcher with the `/td` prefix:
+
+![Launcher showing the /td prefix and Todoist task results](screenshots/launcher-capture.webp)
+
 ## Plugin
 
 | Field | Value |
@@ -14,7 +33,7 @@ quick-add tasks.
 
 ## Requirements
 
-- Noctalia v5.3.0 or newer (`plugin_api = 33`).
+- Noctalia v5.4.0 or newer (`plugin_api = 47`).
 - A Todoist account and an API token (Settings → Integrations → Developer → API
   token). Provide the token in one of these places; the first match wins:
   1. `TODOIST_API_TOKEN` in the environment Noctalia runs in.
