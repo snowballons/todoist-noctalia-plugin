@@ -66,6 +66,13 @@ description_key = "settings.confirm_delete.description"
 default = true
 
 [[setting]]
+key = "quick_add_description"
+type = "bool"
+label_key = "settings.quick_add_description.label"
+description_key = "settings.quick_add_description.description"
+default = false
+
+[[setting]]
 key = "max_retries"
 type = "int"
 label_key = "settings.max_retries.label"

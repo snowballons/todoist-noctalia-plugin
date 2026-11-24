@@ -36,6 +36,8 @@ local ACTION_DISMISS = "#6B7280"
 local statusText = nil
 local statusKind = nil -- nil | "ok" | "err" | "warn"
 local quickText = ""
+local quickDesc = ""
+local showQuickDesc = nil
 local quickKey = 0
 
 -- Undo state for task.complete. Captured before the row is removed so the
@@ -138,13 +140,25 @@ local function openProject(id)
 	end
 end
 
+local function isQuickDescVisible()
+	if showQuickDesc ~= nil then
+		return showQuickDesc
+	end
+	return noctalia.getConfig("quick_add_description") == true
+end
+
 local function submitQuick()
 	local text = noctalia.string.trim(quickText)
 	if text == "" or client.busy() then
 		return
 	end
-	if client.send("task.create", { text = text }) then
+	local note = nil
+	if isQuickDescVisible() and noctalia.string.trim(quickDesc) ~= "" then
+		note = noctalia.string.trim(quickDesc)
+	end
+	if client.send("task.create", { text = text, note = note }) then
 		quickText = ""
+		quickDesc = ""
 		quickKey = quickKey + 1
 		render()
 	end
@@ -633,22 +647,52 @@ local function undoRow()
 end
 
 local function quickAddBlock()
+	local descOpen = isQuickDescVisible()
+	local inputs = {
+		ui.input({
+			key = "quick" .. tostring(quickKey),
+			value = "",
+			multiline = true,
+			placeholder = noctalia.tr("ui.panel.quick.placeholder"),
+			flexGrow = 1,
+			controlSize = "md",
+			enabled = not client.busy(),
+			onChange = function(text)
+				quickText = text or ""
+			end,
+			onSubmit = function()
+				submitQuick()
+			end,
+		}),
+	}
+	if descOpen then
+		inputs[#inputs + 1] = ui.input({
+			key = "quickdesc" .. tostring(quickKey),
+			value = quickDesc,
+			multiline = true,
+			placeholder = noctalia.tr("ui.panel.quick.description_ph"),
+			flexGrow = 1,
+			controlSize = "md",
+			enabled = not client.busy(),
+			onChange = function(text)
+				quickDesc = text or ""
+			end,
+		})
+	end
+
 	local items = {
 		ui.separator({ key = "qa-sep" }),
 		ui.row({ key = "qa-row", gap = 6, align = "center" }, {
-			ui.input({
-				key = "quick" .. tostring(quickKey),
-				value = "",
-				multiline = true,
-				placeholder = noctalia.tr("ui.panel.quick.placeholder"),
-				flexGrow = 1,
+			ui.column({ gap = 4, flexGrow = 1 }, inputs),
+			ui.button({
+				glyph = "align-left",
+				variant = descOpen and "secondary" or "ghost",
 				controlSize = "md",
+				tooltip = noctalia.tr("ui.panel.quick.toggle_desc"),
 				enabled = not client.busy(),
-				onChange = function(text)
-					quickText = text or ""
-				end,
-				onSubmit = function()
-					submitQuick()
+				onClick = function()
+					showQuickDesc = not descOpen
+					render()
 				end,
 			}),
 			ui.button({
