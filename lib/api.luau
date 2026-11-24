@@ -244,7 +244,18 @@ end
 function M.quickAdd(token, text, note, cb)
 	local body = { text = text }
 	if note ~= nil and note ~= "" then
-		body.note = note
+		local trimmedNote = tostring(note):match("^%s*(.-)%s*$")
+		if trimmedNote ~= "" then
+			-- In Todoist Quick Add, text followed by ' // <description>' sets
+			-- the task's first-class description field, whereas the body's 'note'
+			-- parameter creates a comment. Append ' // ' so the description
+			-- appears on the task and in the edit form.
+			local hasDelimiter = text:match("%s//") ~= nil or text:sub(1, 2) == "//"
+			if not hasDelimiter then
+				body.text = text .. " // " .. trimmedNote
+			end
+			body.note = trimmedNote
+		end
 	end
 	M.request(token, "POST", "/tasks/quick", body, cb)
 end
