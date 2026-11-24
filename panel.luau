@@ -459,13 +459,16 @@ local function descriptionBlock(t)
 	return ui.row({
 		key = "desc" .. id,
 		paddingH = 32,
-		paddingV = 2,
+		paddingV = 4,
+		fill = true,
 	}, {
 		ui.label({
 			text = t.description or "",
 			color = MUTED,
 			fontSize = 12,
-			maxLines = 10,
+			flexGrow = 1,
+			wrap = true,
+			maxLines = 50,
 		}),
 	})
 end
