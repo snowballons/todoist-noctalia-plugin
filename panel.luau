@@ -632,6 +632,59 @@ local function undoRow()
 	})
 end
 
+local function quickAddBlock()
+	local items = {
+		ui.separator({ key = "qa-sep" }),
+		ui.row({ key = "qa-row", gap = 6, align = "center" }, {
+			ui.input({
+				key = "quick" .. tostring(quickKey),
+				value = "",
+				multiline = true,
+				placeholder = noctalia.tr("ui.panel.quick.placeholder"),
+				flexGrow = 1,
+				controlSize = "md",
+				enabled = not client.busy(),
+				onChange = function(text)
+					quickText = text or ""
+				end,
+				onSubmit = function()
+					submitQuick()
+				end,
+			}),
+			ui.button({
+				glyph = "plus",
+				text = noctalia.tr("ui.panel.quick.add"),
+				variant = "primary",
+				controlSize = "md",
+				-- Text inputs are uncontrolled and do not re-render on keystroke,
+				-- so diff-driven enabled stays false while typing. Gate on busy only.
+				enabled = not client.busy(),
+				onClick = function()
+					submitQuick()
+				end,
+			}),
+		}),
+		ui.label({
+			key = "qa-hint",
+			text = noctalia.tr("ui.panel.quick.hint"),
+			fontSize = 11,
+			color = MUTED,
+			maxLines = 2,
+		}),
+	}
+	local summary = defaultsSummary()
+	if summary then
+		items[#items + 1] = ui.label({
+			key = "qa-defaults",
+			text = noctalia.tr("ui.panel.quick.defaults", { summary = summary }),
+			fontSize = 11,
+			color = MUTED,
+			maxLines = 1,
+		})
+	end
+	return ui.column({ key = "qa-block", gap = 6 }, items)
+end
+
 local function taskList()
 	local tasks = snap.tasks or {}
 	local rows = {}
@@ -655,56 +708,6 @@ local function taskList()
 				rows[#rows + 1] = taskItem(t)
 			end
 		end
-	end
-
-	-- Quick-add lives below the tasks inside the scroll so it floats down
-	-- naturally as tasks are added and only scrolls away when the list is long.
-	rows[#rows + 1] = ui.separator({ key = "qa-sep" })
-	rows[#rows + 1] = ui.row({ key = "qa-row", gap = 6, align = "center" }, {
-		ui.input({
-			key = "quick" .. tostring(quickKey),
-			value = "",
-			multiline = true,
-			placeholder = noctalia.tr("ui.panel.quick.placeholder"),
-			flexGrow = 1,
-			controlSize = "md",
-			enabled = not client.busy(),
-			onChange = function(text)
-				quickText = text or ""
-			end,
-			onSubmit = function()
-				submitQuick()
-			end,
-		}),
-		ui.button({
-			glyph = "plus",
-			text = noctalia.tr("ui.panel.quick.add"),
-			variant = "primary",
-			controlSize = "md",
-			-- Text inputs are uncontrolled and do not re-render on keystroke,
-			-- so diff-driven enabled stays false while typing. Gate on busy only.
-			enabled = not client.busy(),
-			onClick = function()
-				submitQuick()
-			end,
-		}),
-	})
-	rows[#rows + 1] = ui.label({
-		key = "qa-hint",
-		text = noctalia.tr("ui.panel.quick.hint"),
-		fontSize = 11,
-		color = MUTED,
-		maxLines = 2,
-	})
-	local summary = defaultsSummary()
-	if summary then
-		rows[#rows + 1] = ui.label({
-			key = "qa-defaults",
-			text = noctalia.tr("ui.panel.quick.defaults", { summary = summary }),
-			fontSize = 11,
-			color = MUTED,
-			maxLines = 1,
-		})
 	end
 
 	return ui.scroll({
@@ -1259,11 +1262,22 @@ local function footer()
 		return nil
 	end
 
-	-- List / projects mode: separator + optional banner. Quick-add now lives
-	-- inside the taskList() scroll so it is not duplicated here.
-	local items = { ui.separator({}) }
+	-- Pinned quick-add lives in the footer so it is always visible and never
+	-- pushed away by a long list of tasks.
+	local items = {}
+	if snap.token_configured ~= false and mode == "list" and view() ~= "completed" then
+		items[#items + 1] = quickAddBlock()
+	end
+
 	if banner then
+		if #items == 0 then
+			items[#items + 1] = ui.separator({})
+		end
 		items[#items + 1] = banner
+	end
+
+	if #items == 0 then
+		return nil
 	end
 	return ui.column({ gap = 8 }, items)
 end
