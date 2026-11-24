@@ -661,6 +661,7 @@ local function taskList()
 		ui.input({
 			key = "quick" .. tostring(quickKey),
 			value = "",
+			multiline = true,
 			placeholder = noctalia.tr("ui.panel.quick.placeholder"),
 			flexGrow = 1,
 			controlSize = "md",
