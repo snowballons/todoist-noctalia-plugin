@@ -677,7 +677,9 @@ local function taskList()
 			text = noctalia.tr("ui.panel.quick.add"),
 			variant = "primary",
 			controlSize = "md",
-			enabled = (not client.busy()) and noctalia.string.trim(quickText) ~= "",
+			-- Text inputs are uncontrolled and do not re-render on keystroke,
+			-- so diff-driven enabled stays false while typing. Gate on busy only.
+			enabled = not client.busy(),
 			onClick = function()
 				submitQuick()
 			end,
