@@ -195,6 +195,11 @@ local function header()
 				if mode == "help" then
 					mode = "list"
 				else
+					if mode == "edit" then
+						editId = nil
+						edit = nil
+						editErr = nil
+					end
 					mode = "help"
 				end
 				render()
