@@ -5,33 +5,30 @@
 -- while clicking the task body toggles its description inline (if any).
 local state = require("./lib/state.luau")
 local dates = require("./lib/dates.luau")
+local theme = require("./lib/theme.luau")
+local uiOnboarding = require("./lib/ui_onboarding.luau")
+local uiHelp = require("./lib/ui_help.luau")
+local uiNav = require("./lib/ui_nav.luau")
 
 noctalia.setUpdateInterval(1000)
 
-local PCOLOR = {
-	[1] = "#e5484d", -- p1 / very urgent
-	[2] = "#f5a524", -- p2
-	[3] = "#3b82f6", -- p3
-	[4] = "#8b8d98", -- p4 / natural
-}
-local MUTED = "#8b8d98"
-local DANGER = "#e5484d"
+local PCOLOR = theme.PCOLOR
+local MUTED = theme.MUTED
+local DANGER = theme.DANGER
+local ACTION_OPEN = theme.ACTION_OPEN
+local ACTION_DO = theme.ACTION_DO
+local ACTION_DISMISS = theme.ACTION_DISMISS
 
 local client = state.new("panel")
 
 local snap = {}
 local open = false
-local mode = "list" -- "list" | "projects" | "edit"
+local mode = "list" -- "list" | "projects" | "edit" | "help"
 local highlightId = nil
 local confirmDeleteId = nil -- task id awaiting a delete confirmation
 local actionId = nil -- task id whose complete/reopen pair is expanded
 local actionHover = nil -- nil | "do" | "dismiss"
 local expandedDescId = nil -- task id whose description is expanded inline
-
--- Row outline while the action pair is open, then the hovered action's tint.
-local ACTION_OPEN = "outline_variant/0.7"
-local ACTION_DO = "#16A34A"
-local ACTION_DISMISS = "#6B7280"
 
 local statusText = nil
 local statusKind = nil -- nil | "ok" | "err" | "warn"
@@ -166,135 +163,56 @@ end
 
 -- ── pieces ──────────────────────────────────────────────────────
 local function header()
-	return ui.row({ align = "center", gap = 6 }, {
-		ui.label({
-			text = noctalia.tr("ui.panel.title"),
-			fontSize = 16,
-			fontWeight = "bold",
-			color = "primary",
-			flexGrow = 1,
-		}),
-		ui.button({
-			glyph = "refresh",
-			variant = "ghost",
-			controlSize = "sm",
-			tooltip = noctalia.tr("ui.panel.refresh"),
-			enabled = not client.busy(),
-			onClick = function()
-				if client.send("tasks.refresh", {}) then
-					render()
-				end
-			end,
-		}),
-		ui.button({
-			glyph = "help-circle",
-			variant = (mode == "help") and "secondary" or "ghost",
-			controlSize = "sm",
-			tooltip = noctalia.tr("ui.panel.help"),
-			onClick = function()
-				if mode == "help" then
-					mode = "list"
-				else
-					if mode == "edit" then
-						editId = nil
-						edit = nil
-						editErr = nil
-					end
-					mode = "help"
-				end
+	return uiNav.header({
+		busy = client.busy(),
+		mode = mode,
+		onRefresh = function()
+			if client.send("tasks.refresh", {}) then
 				render()
-			end,
-		}),
-		ui.button({
-			glyph = "settings",
-			variant = "ghost",
-			controlSize = "sm",
-			tooltip = noctalia.tr("ui.panel.settings"),
-			onClick = function()
-				noctalia.openSettings()
-			end,
-		}),
-		ui.button({
-			glyph = "x",
-			variant = "ghost",
-			controlSize = "sm",
-			tooltip = noctalia.tr("ui.panel.close"),
-			onClick = function()
-				panel.close()
-			end,
-		}),
+			end
+		end,
+		onToggleHelp = function()
+			if mode == "help" then
+				mode = "list"
+			else
+				if mode == "edit" then
+					editId = nil
+					edit = nil
+					editErr = nil
+				end
+				mode = "help"
+			end
+			render()
+		end,
+		onOpenSettings = function()
+			noctalia.openSettings()
+		end,
+		onClose = function()
+			panel.close()
+		end,
 	})
 end
 
 local function tiles()
-	local counts = snap.counts or {}
-	local function tile(key, labelKey, glyphName)
-		local c = tonumber(counts[key]) or 0
-		return ui.button({
-			glyph = glyphName,
-			text = noctalia.tr(labelKey) .. (c > 0 and ("  " .. tostring(c)) or ""),
-			variant = (mode == "list" and view() == key) and "primary" or "ghost",
-			controlSize = "sm",
-			onClick = function()
-				goView(key)
-			end,
-		})
-	end
-	return ui.row({ gap = 6, align = "center" }, {
-		tile("overdue", "ui.panel.filter.overdue", "alert-circle"),
-		tile("today", "ui.panel.filter.today", "clock"),
-		tile("p1", "ui.panel.filter.p1", "flag"),
+	return uiNav.tiles({
+		counts = snap.counts,
+		mode = mode,
+		activeView = view(),
+		onSelectView = goView,
 	})
 end
 
 local function nav()
-	local activeProjectId = nil
-	local v = view()
-	if mode == "list" and type(v) == "string" and v:match("^project:") then
-		activeProjectId = v:sub(9)
-	end
-	local function tab(key, labelKey, glyphName, active)
-		return ui.button({
-			glyph = glyphName,
-			text = noctalia.tr(labelKey),
-			variant = active and "secondary" or "ghost",
-			controlSize = "sm",
-			onClick = function()
-				if key == "__projects" then
-					mode = "projects"
-					render()
-				else
-					goView(key)
-				end
-			end,
-		})
-	end
-	local items = {
-		tab("today", "ui.panel.nav.today", "calendar", mode == "list" and v == "today"),
-		tab("inbox", "ui.panel.nav.inbox", "inbox", mode == "list" and v == "inbox"),
-		tab("__projects", "ui.panel.nav.projects", "folder", mode == "projects" or activeProjectId ~= nil),
-		tab("completed", "ui.panel.nav.completed", "circle-check", mode == "list" and v == "completed"),
-	}
-	if activeProjectId then
-		local name = projectName(activeProjectId)
-		if name then
-			items[#items + 1] = ui.label({
-				text = "·  " .. name,
-				fontSize = 12,
-				color = MUTED,
-				flexGrow = 1,
-				maxLines = 1,
-			})
-		end
-	end
-	return ui.row({
-		gap = 4,
-		align = "center",
-		fill = "surface_container_highest/0.4",
-		radius = 8,
-		paddingH = 4,
-		paddingV = 3,
-	}, items)
+	return uiNav.nav({
+		mode = mode,
+		activeView = view(),
+		projectName = projectName,
+		onSelectView = goView,
+		onSelectProjects = function()
+			mode = "projects"
+			render()
+		end,
+	})
 end
 
 -- ── undo ────────────────────────────────────────────────────────
@@ -1294,172 +1212,13 @@ local function editForm()
 end
 
 local function onboardingCard()
-	return ui.scroll({ flexGrow = 1, fill = true }, {
-		ui.column({
-			gap = 12,
-			fill = true,
-			padding = 16,
-			radius = 10,
-			background = "surface_container_low",
-		}, {
-			ui.row({ gap = 8, align = "center" }, {
-				ui.glyph({ name = "sparkles", size = 20, color = "primary" }),
-				ui.label({
-					text = noctalia.tr("ui.panel.onboarding.welcome_title"),
-					fontSize = 15,
-					fontWeight = "bold",
-					color = "primary",
-				}),
-			}),
-			ui.label({
-				text = noctalia.tr("ui.panel.onboarding.welcome_desc"),
-				fontSize = 12,
-				color = MUTED,
-				maxLines = 3,
-				wrap = true,
-			}),
-			ui.label({
-				text = noctalia.tr("ui.panel.not_configured"),
-				fontSize = 12,
-				color = DANGER,
-				fontWeight = "bold",
-				maxLines = 2,
-			}),
-			ui.separator({}),
-			ui.column({ gap = 6 }, {
-				ui.label({
-					text = noctalia.tr("ui.panel.onboarding.step1_title"),
-					fontWeight = "bold",
-					fontSize = 12,
-				}),
-				ui.label({
-					text = noctalia.tr("ui.panel.onboarding.step1_desc"),
-					fontSize = 11,
-					color = MUTED,
-					wrap = true,
-				}),
-				ui.button({
-					text = noctalia.tr("ui.panel.onboarding.step1_btn"),
-					glyph = "external-link",
-					variant = "secondary",
-					controlSize = "sm",
-					onClick = function()
-						openUrl("https://app.todoist.com/app/settings/integrations/developer")
-					end,
-				}),
-			}),
-			ui.column({ gap = 6 }, {
-				ui.label({
-					text = noctalia.tr("ui.panel.onboarding.step2_title"),
-					fontWeight = "bold",
-					fontSize = 12,
-				}),
-				ui.label({
-					text = noctalia.tr("ui.panel.onboarding.step2_desc"),
-					fontSize = 11,
-					color = MUTED,
-					wrap = true,
-				}),
-				ui.button({
-					text = noctalia.tr("ui.panel.onboarding.step2_btn"),
-					glyph = "settings",
-					variant = "primary",
-					controlSize = "sm",
-					onClick = function()
-						noctalia.openSettings()
-					end,
-				}),
-			}),
-		}),
+	return uiOnboarding.card({
+		openUrl = openUrl,
 	})
 end
 
 local function helpView()
-	local function shortcutRow(keys, desc)
-		return ui.row({ gap = 8, align = "center", paddingV = 2 }, {
-			ui.row({
-				paddingH = 6,
-				paddingV = 2,
-				radius = 4,
-				fill = "surface_container_highest/0.6",
-			}, {
-				ui.label({ text = keys, fontSize = 11, fontWeight = "bold", color = "primary" }),
-			}),
-			ui.label({ text = desc, fontSize = 11, color = MUTED, flexGrow = 1, wrap = true }),
-		})
-	end
-
-	local function syntaxRow(symbol, desc)
-		return ui.row({ gap = 8, align = "center", paddingV = 2 }, {
-			ui.row({
-				paddingH = 6,
-				paddingV = 2,
-				radius = 4,
-				fill = "surface_container_highest/0.6",
-			}, {
-				ui.label({ text = symbol, fontSize = 11, fontWeight = "bold" }),
-			}),
-			ui.label({ text = desc, fontSize = 11, color = MUTED, flexGrow = 1, wrap = true }),
-		})
-	end
-
-	return ui.scroll({ flexGrow = 1, fill = true }, {
-		ui.column({ gap = 12, fill = true }, {
-			-- Section 1: Keyboard Shortcuts
-			ui.column({ gap = 6 }, {
-				ui.row({ gap = 6, align = "center" }, {
-					ui.glyph({ name = "keyboard", size = 14, color = "primary" }),
-					ui.label({
-						text = noctalia.tr("ui.panel.help_view.shortcuts_title"),
-						fontSize = 12,
-						fontWeight = "bold",
-					}),
-				}),
-				shortcutRow("Ctrl + Enter", noctalia.tr("ui.panel.help_view.shortcut_ctrl_enter_desc")),
-				shortcutRow("Enter", noctalia.tr("ui.panel.help_view.shortcut_enter_desc")),
-				shortcutRow("Esc", noctalia.tr("ui.panel.help_view.shortcut_esc_desc")),
-			}),
-
-			ui.separator({}),
-
-			-- Section 2: Quick Add Syntax
-			ui.column({ gap = 6 }, {
-				ui.row({ gap = 6, align = "center" }, {
-					ui.glyph({ name = "sparkles", size = 14, color = "primary" }),
-					ui.label({
-						text = noctalia.tr("ui.panel.help_view.syntax_title"),
-						fontSize = 12,
-						fontWeight = "bold",
-					}),
-				}),
-				syntaxRow("#project", noctalia.tr("ui.panel.help_view.syntax_project_desc")),
-				syntaxRow("@label", noctalia.tr("ui.panel.help_view.syntax_label_desc")),
-				syntaxRow("p1 .. p4", noctalia.tr("ui.panel.help_view.syntax_priority_desc")),
-				syntaxRow("today / 5pm / ev fri", noctalia.tr("ui.panel.help_view.syntax_dates_desc")),
-				syntaxRow("// note", noctalia.tr("ui.panel.help_view.syntax_desc_desc")),
-			}),
-
-			ui.separator({}),
-
-			-- Section 3: Launcher Quick Capture
-			ui.column({ gap = 4 }, {
-				ui.row({ gap = 6, align = "center" }, {
-					ui.glyph({ name = "terminal", size = 14, color = "primary" }),
-					ui.label({
-						text = noctalia.tr("ui.panel.help_view.launcher_title"),
-						fontSize = 12,
-						fontWeight = "bold",
-					}),
-				}),
-				ui.label({
-					text = noctalia.tr("ui.panel.help_view.launcher_desc"),
-					fontSize = 11,
-					color = MUTED,
-					wrap = true,
-				}),
-			}),
-		}),
-	})
+	return uiHelp.view()
 end
 
 local function body()
