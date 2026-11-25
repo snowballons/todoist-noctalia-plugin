@@ -209,9 +209,10 @@ end
 
 local function tiles()
 	local counts = snap.counts or {}
-	local function tile(key, labelKey)
+	local function tile(key, labelKey, glyphName)
 		local c = tonumber(counts[key]) or 0
 		return ui.button({
+			glyph = glyphName,
 			text = noctalia.tr(labelKey) .. (c > 0 and ("  " .. tostring(c)) or ""),
 			variant = (mode == "list" and view() == key) and "primary" or "ghost",
 			controlSize = "sm",
@@ -220,10 +221,10 @@ local function tiles()
 			end,
 		})
 	end
-	return ui.row({ gap = 6 }, {
-		tile("overdue", "ui.panel.filter.overdue"),
-		tile("today", "ui.panel.filter.today"),
-		tile("p1", "ui.panel.filter.p1"),
+	return ui.row({ gap = 6, align = "center" }, {
+		tile("overdue", "ui.panel.filter.overdue", "alert-circle"),
+		tile("today", "ui.panel.filter.today", "clock"),
+		tile("p1", "ui.panel.filter.p1", "flag"),
 	})
 end
 
@@ -233,8 +234,9 @@ local function nav()
 	if mode == "list" and type(v) == "string" and v:match("^project:") then
 		activeProjectId = v:sub(9)
 	end
-	local function tab(key, labelKey, active)
+	local function tab(key, labelKey, glyphName, active)
 		return ui.button({
+			glyph = glyphName,
 			text = noctalia.tr(labelKey),
 			variant = active and "secondary" or "ghost",
 			controlSize = "sm",
@@ -249,10 +251,10 @@ local function nav()
 		})
 	end
 	local items = {
-		tab("today", "ui.panel.nav.today", mode == "list" and v == "today"),
-		tab("inbox", "ui.panel.nav.inbox", mode == "list" and v == "inbox"),
-		tab("__projects", "ui.panel.nav.projects", mode == "projects" or activeProjectId ~= nil),
-		tab("completed", "ui.panel.nav.completed", mode == "list" and v == "completed"),
+		tab("today", "ui.panel.nav.today", "calendar", mode == "list" and v == "today"),
+		tab("inbox", "ui.panel.nav.inbox", "inbox", mode == "list" and v == "inbox"),
+		tab("__projects", "ui.panel.nav.projects", "folder", mode == "projects" or activeProjectId ~= nil),
+		tab("completed", "ui.panel.nav.completed", "circle-check", mode == "list" and v == "completed"),
 	}
 	if activeProjectId then
 		local name = projectName(activeProjectId)
@@ -266,7 +268,14 @@ local function nav()
 			})
 		end
 	end
-	return ui.row({ gap = 6, align = "center" }, items)
+	return ui.row({
+		gap = 4,
+		align = "center",
+		fill = "surface_container_highest/0.4",
+		radius = 8,
+		paddingH = 4,
+		paddingV = 3,
+	}, items)
 end
 
 -- ── undo ────────────────────────────────────────────────────────
