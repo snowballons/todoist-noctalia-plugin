@@ -728,6 +728,7 @@ local function quickAddBlock()
 				text = noctalia.tr("ui.panel.quick.add"),
 				variant = "primary",
 				controlSize = "md",
+				tooltip = noctalia.tr("ui.panel.quick.add_tooltip"),
 				-- Text inputs are uncontrolled and do not re-render on keystroke,
 				-- so diff-driven enabled stays false while typing. Gate on busy only.
 				enabled = not client.busy(),

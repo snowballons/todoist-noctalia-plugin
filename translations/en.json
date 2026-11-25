@@ -162,6 +162,7 @@
       },
       "quick": {
         "add": "Add",
+        "add_tooltip": "Add task (Ctrl+Enter)",
         "defaults": "Defaults: {summary}",
         "description_ph": "Description (optional)...",
         "hint": "Todoist parses dates, projects, labels and priorities.",

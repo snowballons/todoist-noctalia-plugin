@@ -2106,5 +2106,9 @@ end
 settlePanel()
 check("back returns to list view", not hasLabelText("ui.panel.help_view.title"))
 
+-- 3. Quick add button shortcut tooltip
+local plusBtn = findButton(function(p) return p.glyph == "plus" end)
+check("add button has shortcut tooltip", plusBtn ~= nil and plusBtn.props.tooltip == "ui.panel.quick.add_tooltip")
+
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)
