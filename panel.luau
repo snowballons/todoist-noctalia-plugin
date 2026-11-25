@@ -187,6 +187,20 @@ local function header()
 			end,
 		}),
 		ui.button({
+			glyph = "help-circle",
+			variant = (mode == "help") and "secondary" or "ghost",
+			controlSize = "sm",
+			tooltip = noctalia.tr("ui.panel.help"),
+			onClick = function()
+				if mode == "help" then
+					mode = "list"
+				else
+					mode = "help"
+				end
+				render()
+			end,
+		}),
+		ui.button({
 			glyph = "settings",
 			variant = "ghost",
 			controlSize = "sm",
@@ -1273,9 +1287,181 @@ local function editForm()
 	})
 end
 
+local function onboardingCard()
+	return ui.scroll({ flexGrow = 1, fill = true }, {
+		ui.column({
+			gap = 12,
+			fill = true,
+			padding = 16,
+			radius = 10,
+			background = "surface_container_low",
+		}, {
+			ui.row({ gap = 8, align = "center" }, {
+				ui.glyph({ name = "sparkles", size = 20, color = "primary" }),
+				ui.label({
+					text = noctalia.tr("ui.panel.onboarding.welcome_title"),
+					fontSize = 15,
+					fontWeight = "bold",
+					color = "primary",
+				}),
+			}),
+			ui.label({
+				text = noctalia.tr("ui.panel.onboarding.welcome_desc"),
+				fontSize = 12,
+				color = MUTED,
+				maxLines = 3,
+				wrap = true,
+			}),
+			ui.label({
+				text = noctalia.tr("ui.panel.not_configured"),
+				fontSize = 12,
+				color = DANGER,
+				fontWeight = "bold",
+				maxLines = 2,
+			}),
+			ui.separator({}),
+			ui.column({ gap = 6 }, {
+				ui.label({
+					text = noctalia.tr("ui.panel.onboarding.step1_title"),
+					fontWeight = "bold",
+					fontSize = 12,
+				}),
+				ui.label({
+					text = noctalia.tr("ui.panel.onboarding.step1_desc"),
+					fontSize = 11,
+					color = MUTED,
+					wrap = true,
+				}),
+				ui.button({
+					text = noctalia.tr("ui.panel.onboarding.step1_btn"),
+					glyph = "external-link",
+					variant = "secondary",
+					controlSize = "sm",
+					onClick = function()
+						openUrl("https://app.todoist.com/app/settings/integrations/developer")
+					end,
+				}),
+			}),
+			ui.column({ gap = 6 }, {
+				ui.label({
+					text = noctalia.tr("ui.panel.onboarding.step2_title"),
+					fontWeight = "bold",
+					fontSize = 12,
+				}),
+				ui.label({
+					text = noctalia.tr("ui.panel.onboarding.step2_desc"),
+					fontSize = 11,
+					color = MUTED,
+					wrap = true,
+				}),
+				ui.button({
+					text = noctalia.tr("ui.panel.onboarding.step2_btn"),
+					glyph = "settings",
+					variant = "primary",
+					controlSize = "sm",
+					onClick = function()
+						noctalia.openSettings()
+					end,
+				}),
+			}),
+		}),
+	})
+end
+
+local function helpView()
+	local function shortcutRow(keys, desc)
+		return ui.row({ gap = 8, align = "center", paddingV = 2 }, {
+			ui.row({
+				paddingH = 6,
+				paddingV = 2,
+				radius = 4,
+				fill = "surface_container_highest/0.6",
+			}, {
+				ui.label({ text = keys, fontSize = 11, fontWeight = "bold", color = "primary" }),
+			}),
+			ui.label({ text = desc, fontSize = 11, color = MUTED, flexGrow = 1, wrap = true }),
+		})
+	end
+
+	local function syntaxRow(symbol, desc)
+		return ui.row({ gap = 8, align = "center", paddingV = 2 }, {
+			ui.row({
+				paddingH = 6,
+				paddingV = 2,
+				radius = 4,
+				fill = "surface_container_highest/0.6",
+			}, {
+				ui.label({ text = symbol, fontSize = 11, fontWeight = "bold" }),
+			}),
+			ui.label({ text = desc, fontSize = 11, color = MUTED, flexGrow = 1, wrap = true }),
+		})
+	end
+
+	return ui.scroll({ flexGrow = 1, fill = true }, {
+		ui.column({ gap = 12, fill = true }, {
+			-- Section 1: Keyboard Shortcuts
+			ui.column({ gap = 6 }, {
+				ui.row({ gap = 6, align = "center" }, {
+					ui.glyph({ name = "keyboard", size = 14, color = "primary" }),
+					ui.label({
+						text = noctalia.tr("ui.panel.help_view.shortcuts_title"),
+						fontSize = 12,
+						fontWeight = "bold",
+					}),
+				}),
+				shortcutRow("Ctrl + Enter", noctalia.tr("ui.panel.help_view.shortcut_ctrl_enter_desc")),
+				shortcutRow("Enter", noctalia.tr("ui.panel.help_view.shortcut_enter_desc")),
+				shortcutRow("Esc", noctalia.tr("ui.panel.help_view.shortcut_esc_desc")),
+			}),
+
+			ui.separator({}),
+
+			-- Section 2: Quick Add Syntax
+			ui.column({ gap = 6 }, {
+				ui.row({ gap = 6, align = "center" }, {
+					ui.glyph({ name = "sparkles", size = 14, color = "primary" }),
+					ui.label({
+						text = noctalia.tr("ui.panel.help_view.syntax_title"),
+						fontSize = 12,
+						fontWeight = "bold",
+					}),
+				}),
+				syntaxRow("#project", noctalia.tr("ui.panel.help_view.syntax_project_desc")),
+				syntaxRow("@label", noctalia.tr("ui.panel.help_view.syntax_label_desc")),
+				syntaxRow("p1 .. p4", noctalia.tr("ui.panel.help_view.syntax_priority_desc")),
+				syntaxRow("today / 5pm / ev fri", noctalia.tr("ui.panel.help_view.syntax_dates_desc")),
+				syntaxRow("// note", noctalia.tr("ui.panel.help_view.syntax_desc_desc")),
+			}),
+
+			ui.separator({}),
+
+			-- Section 3: Launcher Quick Capture
+			ui.column({ gap = 4 }, {
+				ui.row({ gap = 6, align = "center" }, {
+					ui.glyph({ name = "terminal", size = 14, color = "primary" }),
+					ui.label({
+						text = noctalia.tr("ui.panel.help_view.launcher_title"),
+						fontSize = 12,
+						fontWeight = "bold",
+					}),
+				}),
+				ui.label({
+					text = noctalia.tr("ui.panel.help_view.launcher_desc"),
+					fontSize = 11,
+					color = MUTED,
+					wrap = true,
+				}),
+			}),
+		}),
+	})
+end
+
 local function body()
+	if mode == "help" then
+		return helpView()
+	end
 	if snap.token_configured == false then
-		return ui.label({ text = noctalia.tr("ui.panel.not_configured"), color = DANGER, maxLines = 3 })
+		return onboardingCard()
 	end
 	if mode == "edit" then
 		return editForm()
@@ -1306,9 +1492,9 @@ local function footer()
 		})
 	end
 
-	-- In edit mode there is no quick-add and no separator: the edit scroll
+	-- In edit mode or help mode there is no quick-add and no separator: the scroll
 	-- needs every pixel. Only the banner (if any) is shown.
-	if mode == "edit" then
+	if mode == "edit" or mode == "help" then
 		if banner then
 			return banner
 		end
@@ -1359,12 +1545,27 @@ end
 
 render = function()
 	local items = { header() }
-	-- The form takes the whole body: navigation and the quick-add footer would
-	-- only compete with it for space.
-	if mode ~= "edit" then
-		items[#items + 1] = tiles()
-		items[#items + 1] = nav()
-	else
+	if mode == "help" then
+		items[#items + 1] = ui.row({ align = "center", gap = 8 }, {
+			ui.button({
+				glyph = "arrow-left",
+				variant = "ghost",
+				controlSize = "sm",
+				onClick = function()
+					mode = "list"
+					render()
+				end,
+			}),
+			ui.label({
+				text = noctalia.tr("ui.panel.help_view.title"),
+				fontSize = 14,
+				fontWeight = "bold",
+				maxLines = 1,
+			}),
+		})
+	elseif snap.token_configured == false then
+		-- Onboarding takes the full body below the header
+	elseif mode == "edit" then
 		-- Pin the heading above the scroll so it stays visible while the user
 		-- scrolls through all the edit fields.
 		items[#items + 1] = ui.label({
@@ -1373,6 +1574,9 @@ render = function()
 			fontWeight = "bold",
 			maxLines = 1,
 		})
+	else
+		items[#items + 1] = tiles()
+		items[#items + 1] = nav()
 	end
 	items[#items + 1] = body()
 	local f = footer()
@@ -1502,7 +1706,7 @@ function onOpen(_context)
 	-- Restore previous session state so the user can continue where they left off (Issue #2)
 	local session = noctalia.state.get("panel_session")
 	if type(session) == "table" then
-		if session.mode and session.mode ~= "edit" then
+		if session.mode and session.mode ~= "edit" and session.mode ~= "help" then
 			mode = session.mode
 		end
 		if type(session.quickText) == "string" and session.quickText ~= "" then
