@@ -1,3 +1,6 @@
 .DS_Store
 *.tmp
 snapshot.json
+
+ISSUES_ANALYSIS_AND_SOLUTIONS.md
+testing.md
