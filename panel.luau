@@ -1499,6 +1499,23 @@ function onOpen(_context)
 		snap = current
 	end
 
+	-- Restore previous session state so the user can continue where they left off (Issue #2)
+	local session = noctalia.state.get("panel_session")
+	if type(session) == "table" then
+		if session.mode and session.mode ~= "edit" then
+			mode = session.mode
+		end
+		if type(session.quickText) == "string" and session.quickText ~= "" then
+			quickText = session.quickText
+		end
+		if type(session.quickDesc) == "string" and session.quickDesc ~= "" then
+			quickDesc = session.quickDesc
+		end
+		if session.showQuickDesc ~= nil then
+			showQuickDesc = session.showQuickDesc
+		end
+	end
+
 	-- Deep link from the launcher: switch to the task's project and reveal it.
 	local focus = noctalia.state.get("open_task")
 	if type(focus) == "table" and focus.id ~= nil then
@@ -1521,6 +1538,15 @@ function onClose()
 	expandedDescId = nil
 	undoTask = nil
 	undoExpiry = nil
+
+	-- Maintain session state across dismissals (Issue #2)
+	noctalia.state.set("panel_session", {
+		mode = (mode ~= "help") and mode or "list",
+		view = snap.view,
+		quickText = quickText,
+		quickDesc = quickDesc,
+		showQuickDesc = showQuickDesc,
+	})
 end
 
 function update()

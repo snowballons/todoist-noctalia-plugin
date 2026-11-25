@@ -92,8 +92,8 @@ width = 560
 height = 680
 placement = "floating"
 position = "center"
-keyboard_focus = "exclusive"
-dismiss_on_outside_click = false
+keyboard_focus = "on_demand"
+dismiss_on_outside_click = true
 
 [[launcher_provider]]
 id = "capture"
